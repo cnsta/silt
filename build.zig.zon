@@ -1,0 +1,13 @@
+.{
+    .name = .silt,
+    .version = "0.1.0",
+    .fingerprint = 0x81e8b14fc8f3eb96,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
