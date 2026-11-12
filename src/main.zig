@@ -5,6 +5,26 @@ const process = std.process;
 const log = std.log;
 const Io = std.Io;
 
+const flags = @import("flags.zig");
+const Journal = @import("Journal.zig");
+const Model = @import("Model.zig");
+const pstore = @import("pstore.zig");
+const plain = @import("plain.zig");
+const timefmt = @import("timefmt.zig");
+const App = @import("tui/App.zig");
+const Term = @import("tui/Term.zig");
+
+test {
+    _ = @import("Journal.zig");
+    _ = @import("classify.zig");
+    _ = @import("dedup.zig");
+    _ = @import("ending.zig");
+    _ = @import("Model.zig");
+    _ = @import("timefmt.zig");
+    _ = @import("tui/keys.zig");
+    _ = @import("tui/App.zig");
+}
+
 const usage =
     \\usage: silt [options]
     \\
