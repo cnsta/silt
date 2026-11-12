@@ -1,0 +1,161 @@
+const std = @import("std");
+const c = @import("c");
+
+const mem = std.mem;
+const Allocator = mem.Allocator;
+
+const Entry = @import("Entry.zig");
+const catalog = @import("classify.zig").id;
+
+const Journal = @This();
+
+pub const Boot = struct {
+    id: [32]u8,
+    first: u64,
+    last: u64,
+    /// The boot's last entry is journald's "Journal stopped".
+    clean: bool,
+};
+
+pub const Error = error{ JournalOpen, JournalRead, OutOfMemory };
+
+j: *c.sd_journal,
+
+pub fn open() Error!Journal {
+    var j: ?*c.sd_journal = null;
+    // The system journal plus the caller's user journal, like plain journalctl.
+    if (c.sd_journal_open(&j, c.SD_JOURNAL_LOCAL_ONLY) < 0) return error.JournalOpen;
+    return .{ .j = j.? };
+}
+
+pub fn close(self: Journal) void {
+    c.sd_journal_close(self.j);
+}
+
+/// Every boot in the journal, oldest first. Caller owns the slice.
+/// Walks boot to boot in journal order, as journalctl does, so the offsets match
+/// `journalctl -b`. Sorting by wall-clock start would reorder boots after an
+/// RTC jump.
+pub fn boots(self: Journal, gpa: Allocator) Error![]Boot {
+    var list: std.ArrayList(Boot) = .empty;
+    errdefer list.deinit(gpa);
+
+    if (c.sd_journal_seek_head(self.j) < 0) return error.JournalRead;
+    if (c.sd_journal_next(self.j) <= 0) return list.toOwnedSlice(gpa);
+    var id = self.bootId() orelse return error.JournalRead;
+    while (true) {
+        try self.matchBoot(id);
+        const found = c.sd_journal_seek_head(self.j) >= 0 and c.sd_journal_next(self.j) > 0;
+        const first = if (found) self.realtime() else null;
+        const at_tail = c.sd_journal_seek_tail(self.j) >= 0 and c.sd_journal_previous(self.j) > 0;
+        const last = if (at_tail) self.realtime() else null;
+        const clean = at_tail and mem.eql(u8, self.field("MESSAGE_ID") orelse "", catalog.journal_stopped);
+        var cursor: [*c]u8 = null;
+        if (at_tail and c.sd_journal_get_cursor(self.j, &cursor) < 0) cursor = null;
+        defer c.free(cursor);
+        c.sd_journal_flush_matches(self.j);
+        if (first == null or last == null or cursor == null) return error.JournalRead;
+        try list.append(gpa, .{ .id = id, .first = first.?, .last = last.?, .clean = clean });
+
+        // The entry after this boot's last one, in journal order, starts the next boot.
+        if (c.sd_journal_seek_cursor(self.j, cursor) < 0 or c.sd_journal_next(self.j) <= 0) return error.JournalRead;
+        id = while (c.sd_journal_next(self.j) > 0) {
+            const next = self.bootId() orelse continue;
+            if (!mem.eql(u8, &next, &id) and !self.seen(list.items, next)) break next;
+        } else break;
+    }
+    return list.toOwnedSlice(gpa);
+}
+
+fn bootId(self: Journal) ?[32]u8 {
+    const value = self.field("_BOOT_ID") orelse return null;
+    if (value.len != 32) return null;
+    return value[0..32].*;
+}
+
+fn seen(_: Journal, list: []const Boot, id: [32]u8) bool {
+    for (list) |b| if (mem.eql(u8, &b.id, &id)) return true;
+    return false;
+}
+
+/// Every entry of `boot`, oldest first, copied into `arena`.
+pub fn entries(self: Journal, arena: Allocator, boot: *const Boot) Error![]Entry {
+    try self.matchBoot(boot.id);
+    defer c.sd_journal_flush_matches(self.j);
+    if (c.sd_journal_seek_head(self.j) < 0) return error.JournalRead;
+
+    var list: std.ArrayList(Entry) = .empty;
+    while (true) {
+        const rc = c.sd_journal_next(self.j);
+        if (rc < 0) return error.JournalRead;
+        if (rc == 0) break;
+        var unit = try self.dupeFirst(arena, &.{"UNIT"});
+        var user_unit = false;
+        if (unit.len == 0) {
+            unit = try self.dupeFirst(arena, &.{ "USER_UNIT", "_SYSTEMD_USER_UNIT" });
+            user_unit = unit.len != 0;
+        }
+        if (unit.len == 0) unit = try self.dupeFirst(arena, &.{"_SYSTEMD_UNIT"});
+        try list.append(arena, .{
+            .usec = self.realtime() orelse continue,
+            .priority = self.priority(),
+            .kernel = mem.eql(u8, self.field("_TRANSPORT") orelse "", "kernel"),
+            .ident = try self.dupeFirst(arena, &.{ "SYSLOG_IDENTIFIER", "_COMM" }),
+            .message = try self.dupeFirst(arena, &.{"MESSAGE"}),
+            .unit = unit,
+            .user_unit = user_unit,
+            .message_id = try self.dupeFirst(arena, &.{"MESSAGE_ID"}),
+        });
+    }
+    return list.items;
+}
+
+fn matchBoot(self: Journal, id: [32]u8) Error!void {
+    const prefix = "_BOOT_ID=";
+    var buf: [prefix.len + 32]u8 = undefined;
+    @memcpy(buf[0..prefix.len], prefix);
+    @memcpy(buf[prefix.len..], &id);
+    if (c.sd_journal_add_match(self.j, &buf, buf.len) < 0) return error.JournalRead;
+}
+
+fn realtime(self: Journal) ?u64 {
+    var usec: u64 = 0;
+    if (c.sd_journal_get_realtime_usec(self.j, &usec) < 0) return null;
+    return usec;
+}
+
+fn priority(self: Journal) u3 {
+    const value = self.field("PRIORITY") orelse return 6;
+    if (value.len != 1 or value[0] < '0' or value[0] > '7') return 6;
+    return @intCast(value[0] - '0');
+}
+
+/// The value of `name` in the current entry. Valid until the next sd-journal call.
+fn field(self: Journal, comptime name: [:0]const u8) ?[]const u8 {
+    var data: ?*const anyopaque = null;
+    var len: usize = 0;
+    if (c.sd_journal_get_data(self.j, name.ptr, &data, &len) < 0) return null;
+    return fieldValue(data, len, name);
+}
+
+/// A copy of the first of `names` that the current entry has, else "".
+fn dupeFirst(self: Journal, arena: Allocator, comptime names: []const [:0]const u8) Error![]const u8 {
+    inline for (names) |name| {
+        if (self.field(name)) |value| return arena.dupe(u8, value);
+    }
+    return "";
+}
+
+/// sd-journal hands out "NAME=value", strip the name.
+fn fieldValue(data: ?*const anyopaque, len: usize, name: []const u8) ?[]const u8 {
+    const bytes = @as([*]const u8, @ptrCast(data orelse return null))[0..len];
+    if (bytes.len <= name.len or !mem.startsWith(u8, bytes, name) or bytes[name.len] != '=') return null;
+    return bytes[name.len + 1 ..];
+}
+
+test fieldValue {
+    const raw = "MESSAGE=hello";
+    try std.testing.expectEqualStrings("hello", fieldValue(raw, raw.len, "MESSAGE").?);
+    try std.testing.expect(fieldValue(raw, raw.len, "MESSAGE_ID") == null);
+    try std.testing.expect(fieldValue(raw, raw.len, "MESS") == null);
+}
