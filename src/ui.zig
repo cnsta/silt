@@ -81,19 +81,20 @@ pub const Line = struct {
 
     pub fn text(l: *Line, s: []const u8) Writer.Error!void {
         var i: usize = 0;
-        while (i < s.len and l.used < l.width) {
-            const len = unicode.utf8ByteSequenceLength(s[i]) catch 1;
-            if (i + len > s.len or (len > 1 and !unicode.utf8ValidateSlice(s[i .. i + len]))) {
-                try l.w.writeByte('?');
-                i += 1;
-            } else if (len == 1 and (s[i] < 0x20 or s[i] == 0x7f)) {
-                try l.w.writeByte(' ');
-                i += 1;
-            } else {
-                try l.w.writeAll(s[i .. i + len]);
-                i += len;
+        while (i < s.len) {
+            const g = glyph(s[i..]);
+            if (l.used + g.cols > l.width) {
+                // Half a wide character left: blank it so later text can't use it.
+                try l.padTo(l.width);
+                break;
             }
-            l.used += 1;
+            switch (g.out) {
+                .keep => try l.w.writeAll(s[i..][0..g.len]),
+                .byte => |b| try l.w.writeByte(b),
+                .drop => {},
+            }
+            i += g.len;
+            l.used += g.cols;
         }
     }
 
@@ -136,6 +137,104 @@ pub const Line = struct {
         try l.padTo(l.width);
     }
 };
+
+const Glyph = struct {
+    /// Bytes of the input it covers.
+    len: usize,
+    /// Terminal columns it takes.
+    cols: u2,
+    out: union(enum) { keep, byte: u8, drop },
+};
+
+/// The first character of `s` (not empty) as it may be shown: journal text is
+/// untrusted, so invalid UTF-8 becomes "?", control characters (C1 too, U+009B
+/// is CSI) a space, and invisible format characters (bidi overrides, joiners)
+/// are dropped.
+fn glyph(s: []const u8) Glyph {
+    const bad: Glyph = .{ .len = 1, .cols = 1, .out = .{ .byte = '?' } };
+    const len = unicode.utf8ByteSequenceLength(s[0]) catch return bad;
+    if (len > s.len) return bad;
+    const cp = unicode.utf8Decode(s[0..len]) catch return bad;
+    if (cp < 0x20 or (cp >= 0x7f and cp < 0xa0)) return .{ .len = len, .cols = 1, .out = .{ .byte = ' ' } };
+    if (inRanges(cp, &format_ranges)) return .{ .len = len, .cols = 0, .out = .drop };
+    return .{ .len = len, .cols = width(cp), .out = .keep };
+}
+
+const Range = struct { u21, u21 };
+
+const format_ranges = [_]Range{
+    .{ 0x200b, 0x200f }, .{ 0x202a, 0x202e }, .{ 0x2060, 0x206f }, .{ 0xfeff, 0xfeff },
+};
+
+const zero_ranges = [_]Range{
+    .{ 0x0300, 0x036f }, .{ 0x0483, 0x0489 }, .{ 0x0591, 0x05bd },   .{ 0x0610, 0x061a },
+    .{ 0x064b, 0x065f }, .{ 0x1ab0, 0x1aff }, .{ 0x1dc0, 0x1dff },   .{ 0x20d0, 0x20ff },
+    .{ 0xfe00, 0xfe0f }, .{ 0xfe20, 0xfe2f }, .{ 0xe0100, 0xe01ef },
+};
+
+const wide_ranges = [_]Range{
+    .{ 0x1100, 0x115f },   .{ 0x2e80, 0x303e },   .{ 0x3041, 0x33ff },   .{ 0x3400, 0x4dbf },
+    .{ 0x4e00, 0x9fff },   .{ 0xa000, 0xa4cf },   .{ 0xac00, 0xd7a3 },   .{ 0xf900, 0xfaff },
+    .{ 0xfe30, 0xfe4f },   .{ 0xff00, 0xff60 },   .{ 0xffe0, 0xffe6 },   .{ 0x1f300, 0x1f64f },
+    .{ 0x1f680, 0x1f6ff }, .{ 0x1f900, 0x1f9ff }, .{ 0x20000, 0x3fffd },
+};
+
+fn inRanges(cp: u21, ranges: []const Range) bool {
+    for (ranges) |r| if (cp >= r[0] and cp <= r[1]) return true;
+    return false;
+}
+
+/// Columns a printable codepoint takes: a small wcwidth covering combining
+/// marks, CJK and emoji.
+fn width(cp: u21) u2 {
+    if (cp < 0x300) return 1;
+    if (inRanges(cp, &zero_ranges)) return 0;
+    if (inRanges(cp, &wide_ranges)) return 2;
+    return 1;
+}
+
+/// Splits text into display lines: at newlines, and wherever `cols` columns are full.
+pub const Wrap = struct {
+    rest: []const u8,
+    cols: usize,
+
+    pub fn next(w: *Wrap) ?[]const u8 {
+        if (w.rest.len == 0) return null;
+        var i: usize = 0;
+        var used: usize = 0;
+        while (i < w.rest.len and w.rest[i] != '\n') {
+            const g = glyph(w.rest[i..]);
+            // Always take one character, however narrow the line is.
+            if (used + g.cols > w.cols and i > 0) break;
+            i += g.len;
+            used += g.cols;
+        }
+        const line = w.rest[0..i];
+        w.rest = w.rest[i..];
+        if (w.rest.len > 0 and w.rest[0] == '\n') w.rest = w.rest[1..];
+        return line;
+    }
+};
+
+test "Line.text sanitises and counts columns" {
+    var buf: [128]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    var l: Line = .{ .w = &w, .width = 10, .colored = false };
+    try l.text("a\x1bb\x80c\xc2\x9b\xe2\x80\xae世");
+    try std.testing.expectEqualStrings("a b?c 世", w.buffered());
+    try std.testing.expectEqual(8, l.used);
+    // Two columns left, the second wide character doesn't fit in the one after "x".
+    try l.text("x世y");
+    try std.testing.expectEqualStrings("a b?c 世x ", w.buffered());
+    try std.testing.expectEqual(10, l.used);
+}
+
+test Wrap {
+    var w: Wrap = .{ .rest = "abcde\n\nf世界\n", .cols = 3 };
+    const want = [_][]const u8{ "abc", "de", "", "f世", "界" };
+    for (want) |line| try std.testing.expectEqualStrings(line, w.next().?);
+    try std.testing.expectEqual(null, w.next());
+}
 
 /// A sequence of lines: newline-separated for `-plain`, or placed on screen rows
 /// `first..end` for the TUI.
@@ -213,11 +312,16 @@ fn identAndMessage(l: *Line, e: *const Entry, message_color: u24) Writer.Error!v
     try l.padTo(start + ident_width);
     try l.text(" ");
     try l.fg(message_color);
-    try l.text(e.message);
+    // Only the first line: a coredump's message carries its whole stack trace.
+    const body = std.mem.trim(u8, e.message, "\r\n");
+    const end = std.mem.findScalar(u8, body, '\n') orelse body.len;
+    try l.text(body[0..end]);
+    if (end < body.len) try l.text(" …");
 }
 
-/// The Summary tab, and the top of `-plain`.
-pub fn summary(rows: *Rows, m: *const Model, store: pstore.Status) Writer.Error!void {
+/// The Summary tab, and the top of `-plain` (without `latest`: there the whole
+/// notable list follows anyway).
+pub fn summary(rows: *Rows, m: *const Model, store: pstore.Status, latest: bool) Writer.Error!void {
     const kind = m.end.kind;
     var l = try rows.next() orelse return;
 
@@ -312,7 +416,7 @@ pub fn summary(rows: *Rows, m: *const Model, store: pstore.Status) Writer.Error!
         try l.text("nothing notable");
     }
 
-    if (m.notable.len == 0) return;
+    if (!latest or m.notable.len == 0) return;
     l = try rows.next() orelse return;
     l = try rows.next() orelse return;
     try key(l, "latest");
