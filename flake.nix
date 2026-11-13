@@ -16,6 +16,7 @@
   };
 
   outputs = {
+    self,
     nixpkgs,
     zig,
     ...
@@ -44,5 +45,8 @@
     };
 
     formatter = forAllPlatforms (pkgs: pkgs.alejandra);
+
+    nixosModules.silt = ./nix/nixosModule.nix;
+    nixosModules.default = self.nixosModules.silt;
   };
 }

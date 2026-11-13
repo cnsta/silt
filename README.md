@@ -20,10 +20,11 @@ silt -list      # every boot and whether it ended cleanly
 silt -plain     # text, for pipes and ssh (the default when stdout isn't a tty)
 ```
 
-Keys: `tab`/`1`–`4` views, `j`/`k` move, `enter` details with surrounding
-lines, `/` search, `b` pick a boot, `n` toggle noise, `q` quit.
+Keys: `tab`/`1`–`4` views, `j`/`k` move, `enter` details with surrounding lines,
+`/` search, `b` pick a boot, `n` toggle noise, `q` quit.
 
 Reading the system journal needs the `systemd-journal` or `wheel` group.
 
-Build: `nix develop path:. -c zig build` (Zig 0.17, libsystemd), or
-`nix build path:.`.
+Build: `nix develop path:. -c zig build`, or `nix build path:.`. A bare
+`zig build` needs Zig 0.17, pkg-config and libsystemd's development files, which
+NixOS only has inside the dev shell.
