@@ -31,7 +31,7 @@ term: Term,
 journal: Journal,
 boots: []const Journal.Boot,
 model: Model,
-keep_noise: bool,
+options: Model.Options,
 store: pstore.Status,
 frame: Writer.Allocating,
 
@@ -40,7 +40,9 @@ view: View = .summary,
 cursors: std.EnumArray(View, Cursor) = .initFill(.{}),
 search: std.ArrayList(u8) = .empty,
 typing: bool = false,
-/// Indices into the current view's items that match `search`.
+/// The group views list only what is new in this boot.
+only_new: bool = false,
+/// Indices into the current view's items that match `search` and `only_new`.
 visible: std.ArrayList(u32) = .empty,
 detail: struct { center: usize = 0, top: ?usize = null, group: ?dedup.Group = null } = .{},
 picker: Cursor = .{},
@@ -48,14 +50,14 @@ picker: Cursor = .{},
 status: []const u8 = "",
 size: Term.Size = .{ .rows = 24, .cols = 80 },
 
-pub fn init(gpa: Allocator, term: Term, journal: Journal, boots: []const Journal.Boot, model: Model, keep_noise: bool, store: pstore.Status) App {
+pub fn init(gpa: Allocator, term: Term, journal: Journal, boots: []const Journal.Boot, model: Model, options: Model.Options, store: pstore.Status) App {
     return .{
         .gpa = gpa,
         .term = term,
         .journal = journal,
         .boots = boots,
         .model = model,
-        .keep_noise = keep_noise,
+        .options = options,
         .store = store,
         .frame = .init(gpa),
     };
@@ -120,6 +122,9 @@ fn itemGroup(self: *const App, view: View, i: usize) ?dedup.Group {
 }
 
 fn matches(self: *const App, view: View, i: usize) bool {
+    if (self.only_new) {
+        if (self.itemGroup(view, i)) |g| if (!g.new) return false;
+    }
     const q = self.search.items;
     if (q.len == 0) return true;
     const idx = self.itemEntry(view, i);
@@ -189,12 +194,21 @@ fn handleMain(self: *App, k: Key) !bool {
                 self.typing = true;
             },
             'b' => self.openPicker(),
-            'n' => {
-                self.keep_noise = !self.keep_noise;
-                if (self.reload(Model.bootIndex(self.boots.len, self.model.offset).?)) {
-                    self.status = if (self.keep_noise) "noise shown" else "noise hidden";
+            '+' => {
+                if (self.model.compared == 0) {
+                    self.status = "no earlier boots to compare with";
                 } else {
-                    self.keep_noise = !self.keep_noise;
+                    self.only_new = !self.only_new;
+                    if (self.only_new and self.view != .all) self.view = .notable;
+                    try self.refilter();
+                }
+            },
+            'n' => {
+                self.options.keep_noise = !self.options.keep_noise;
+                if (self.reload(Model.bootIndex(self.boots.len, self.model.offset).?)) {
+                    self.status = if (self.options.keep_noise) "noise shown" else "noise hidden";
+                } else {
+                    self.options.keep_noise = !self.options.keep_noise;
                 }
             },
             else => {},
@@ -311,13 +325,14 @@ fn openPicker(self: *App) void {
 
 /// False if the boot couldn't be loaded: the old one stays and `status` says why.
 fn reload(self: *App, index: usize) bool {
-    const m = Model.load(self.gpa, self.journal, self.boots, index, self.keep_noise) catch |err| {
+    const m = Model.load(self.gpa, self.journal, self.boots, index, self.options) catch |err| {
         self.status = @errorName(err);
         return false;
     };
     self.model.deinit();
     self.model = m;
     self.cursors = .initFill(.{});
+    if (m.compared == 0) self.only_new = false;
     self.refilter() catch {};
     return true;
 }
@@ -417,10 +432,19 @@ fn drawTabs(self: *App) !void {
         if (view != .summary) {
             if (!active and view == .notable and worst != .none) try l.fg(color.of(worst));
             try l.print(" {d}", .{self.itemCount(view)});
+            if (view == .notable and m.new_notable > 0) {
+                if (!active) try l.fg(color.new);
+                try l.print(" +{d}", .{m.new_notable});
+            }
         }
         try l.text(" ");
         l.background = null;
         try l.reset();
+    }
+    if (self.only_new) {
+        try l.text("   ");
+        try l.fg(color.new);
+        try l.text("+ new only");
     }
     if (self.search.items.len > 0 and !self.typing) {
         try l.text("   ");
@@ -446,6 +470,9 @@ fn drawList(self: *App) !void {
         if (self.search.items.len > 0) {
             try l.fg(color.base0);
             try l.print("no matches for \"{s}\"", .{self.search.items});
+        } else if (self.only_new and self.itemCount(self.view) > 0) {
+            try l.fg(color.green);
+            try l.text("nothing new in this boot");
         } else {
             try l.fg(color.green);
             try l.text(if (self.view == .notable) "nothing notable in this boot" else "nothing here");
@@ -620,7 +647,7 @@ fn drawFooter(self: *App) !void {
     } else {
         try l.fg(color.base01);
         try l.text(switch (self.mode) {
-            .main => "tab views · j/k move · enter details · / search · b boots · n noise · q quit",
+            .main => "tab views · j/k move · enter details · / search · + new only · b boots · n noise · q quit",
             .detail => "j/k scroll · esc back",
             .boots => "j/k move · enter open · esc back",
         });

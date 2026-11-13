@@ -25,6 +25,9 @@ pub const color = struct {
     pub const cyan: u24 = 0x2aa198;
     pub const green: u24 = 0x859900;
 
+    /// The "+" of a group that is new in this boot.
+    pub const new = yellow;
+
     pub fn of(cat: Category) u24 {
         return switch (cat) {
             .kernel => red,
@@ -220,6 +223,7 @@ test "Line.text sanitises and counts columns" {
     var buf: [128]u8 = undefined;
     var w: Writer = .fixed(&buf);
     var l: Line = .{ .w = &w, .width = 10, .colored = false };
+    // ESC, a stray continuation byte, C1 CSI (U+009B), a bidi override, a wide character.
     try l.text("a\x1bb\x80c\xc2\x9b\xe2\x80\xae世");
     try std.testing.expectEqualStrings("a b?c 世", w.buffered());
     try std.testing.expectEqual(8, l.used);
@@ -270,13 +274,21 @@ pub const Rows = struct {
 pub const label_width = 9;
 pub const ident_width = 18;
 
-/// "  19:01:02  gpu       kernel            amdgpu: ring gfx timeout  ×3"
+/// "  19:01:02 + gpu       kernel            amdgpu: ring gfx timeout  ×3"
+/// The "+" marks a group the earlier boots didn't have.
 pub fn groupRow(l: *Line, m: *const Model, g: dedup.Group) Writer.Error!void {
     const e = &m.entries[g.first];
     try l.text("  ");
     try l.fg(color.base01);
     try l.clock(e.usec);
-    try l.text("  ");
+    if (g.new) {
+        try l.fg(color.new);
+        try l.bold();
+        try l.text(" + ");
+        try l.reset();
+    } else {
+        try l.text("   ");
+    }
     const start = l.used;
     try l.fg(color.of(g.cat));
     try l.bold();
@@ -416,13 +428,52 @@ pub fn summary(rows: *Rows, m: *const Model, store: pstore.Status, latest: bool)
         try l.text("nothing notable");
     }
 
+    if (m.compared > 0) {
+        l = try rows.next() orelse return;
+        try key(l, "new");
+        var buf: [32]u8 = undefined;
+        const before = if (m.compared == 1)
+            "the boot before"
+        else
+            std.fmt.bufPrint(&buf, "the {d} boots before", .{m.compared}) catch "the boots before";
+        if (m.new_notable > 0) {
+            try l.fg(color.new);
+            try l.bold();
+            try l.print("+ {d}", .{m.new_notable});
+            try l.reset();
+            try l.fg(color.base0);
+            try l.print(" of {d} notable events didn't happen in {s}", .{ m.notable.len, before });
+        } else {
+            try l.fg(color.base0);
+            try l.print("nothing that {s} didn't log too", .{before});
+        }
+    }
+
     if (!latest or m.notable.len == 0) return;
+    const max_rows = 8;
     l = try rows.next() orelse return;
     l = try rows.next() orelse return;
+    if (m.new_notable > 0) {
+        // The new ones are what the reader is after, the rest is on the Notable tab.
+        try key(l, "+");
+        try l.fg(color.base01);
+        try l.text("new in this boot, newest last");
+        var skip = m.new_notable -| max_rows;
+        for (m.notable) |g| {
+            if (!g.new) continue;
+            if (skip > 0) {
+                skip -= 1;
+                continue;
+            }
+            l = try rows.next() orelse return;
+            try groupRow(l, m, g);
+        }
+        return;
+    }
     try key(l, "latest");
     try l.fg(color.base01);
     try l.text("notable events, newest last");
-    const shown = @min(m.notable.len, 8);
+    const shown = @min(m.notable.len, max_rows);
     for (m.notable[m.notable.len - shown ..]) |g| {
         l = try rows.next() orelse return;
         try groupRow(l, m, g);
