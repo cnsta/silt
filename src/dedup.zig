@@ -10,6 +10,10 @@ pub const Group = struct {
     last: u32,
     count: u32,
     cat: Category,
+    /// `key` of its entries.
+    key: u64,
+    /// Nothing like it in the boots before (set by Model).
+    new: bool = false,
 };
 
 /// Groups indices (ascending) by identifier plus message with numbers masked,
@@ -20,14 +24,15 @@ pub fn group(gpa: Allocator, entries: []const Entry, cats: []const Category, ind
     var groups: std.ArrayList(Group) = .empty;
     errdefer groups.deinit(gpa);
     for (indices) |i| {
-        const gop = try seen.getOrPut(gpa, key(&entries[i]));
+        const k = key(&entries[i]);
+        const gop = try seen.getOrPut(gpa, k);
         if (gop.found_existing) {
             const g = &groups.items[gop.value_ptr.*];
             g.last = i;
             g.count += 1;
         } else {
             gop.value_ptr.* = @intCast(groups.items.len);
-            try groups.append(gpa, .{ .first = i, .last = i, .count = 1, .cat = cats[i] });
+            try groups.append(gpa, .{ .first = i, .last = i, .count = 1, .cat = cats[i], .key = k });
         }
     }
     return groups.toOwnedSlice(gpa);
@@ -78,6 +83,6 @@ test group {
     const groups = try group(gpa, &entries, &cats, &.{ 0, 1, 2 });
     defer gpa.free(groups);
     try std.testing.expectEqual(2, groups.len);
-    try std.testing.expectEqual(Group{ .first = 0, .last = 2, .count = 2, .cat = .err }, groups[0]);
+    try std.testing.expectEqual(Group{ .first = 0, .last = 2, .count = 2, .cat = .err, .key = key(&entries[0]) }, groups[0]);
     try std.testing.expectEqual(1, groups[1].first);
 }

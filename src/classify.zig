@@ -52,6 +52,16 @@ pub const id = struct {
     pub const journal_stopped = "d93fb3c9c24d451a97cea615ce59c00b";
 };
 
+/// Every id `of` turns into a category on its own. `Journal.Scope.classified`
+/// filters on it, so an id added to `of` must be added here too.
+pub const classified_ids = [_][]const u8{
+    id.coredump, id.terminated_abnormally, id.oomd_kill, id.unit_oom, id.unit_failed, id.job_failed,
+};
+
+test classified_ids {
+    for (classified_ids) |i| try std.testing.expect(of(&.{ .usec = 0, .message_id = i }) != .none);
+}
+
 const process_crash = [_][]const u8{ "segfault at", "traps: " };
 
 const kernel_trouble = [_][]const u8{
