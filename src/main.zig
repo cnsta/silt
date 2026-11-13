@@ -39,6 +39,10 @@ const usage =
     \\  -plain      Print a summary instead of opening the viewer (the default
     \\              when stdout isn't a terminal).
     \\  -noise      Keep the warnings silt normally hides as noise.
+    \\  -history <n>
+    \\              Mark an event as new (+) if nothing like it was logged in the
+    \\              n boots before (default 5, 0 turns it off).
+    \\  -new        With -plain, list only the new notable events.
     \\
 ;
 
@@ -63,6 +67,8 @@ pub fn main(init: process.Init) !void {
         .{ .name = "list", .kind = .boolean },
         .{ .name = "plain", .kind = .boolean },
         .{ .name = "noise", .kind = .boolean },
+        .{ .name = "history", .kind = .arg },
+        .{ .name = "new", .kind = .boolean },
     }).parse(args[1..]) catch {
         std.debug.print("{s}", .{usage});
         process.exit(1);
@@ -86,6 +92,13 @@ pub fn main(init: process.Init) !void {
         log.err("invalid boot '{s}'", .{result.flags.b.?});
         process.exit(1);
     };
+    var options: Model.Options = .{ .keep_noise = result.flags.noise };
+    if (result.flags.history) |arg| {
+        options.history = std.fmt.parseInt(u32, arg, 10) catch {
+            log.err("invalid history '{s}'", .{arg});
+            process.exit(1);
+        };
+    }
 
     c.tzset();
 
@@ -111,14 +124,17 @@ pub fn main(init: process.Init) !void {
         log.err("no boot {d} (the journal has {d})", .{ offset, boots.len });
         process.exit(1);
     };
-    var model = try Model.load(gpa, journal, boots, index, result.flags.noise);
+    var model = try Model.load(gpa, journal, boots, index, options);
     const store = pstore.check(io);
 
     if (result.flags.plain or !tty) {
         defer model.deinit();
         // https://no-color.org
         const no_color = if (init.environ_map.get("NO_COLOR")) |v| v.len > 0 else false;
-        plain.write(w, &model, store, tty and !no_color) catch |err| writeFailed(&out, err);
+        plain.write(w, &model, store, .{
+            .colored = tty and !no_color,
+            .only_new = result.flags.new,
+        }) catch |err| writeFailed(&out, err);
         return;
     }
 
@@ -128,7 +144,7 @@ pub fn main(init: process.Init) !void {
         process.exit(1);
     };
     defer term.leave();
-    var app: App = .init(gpa, term, journal, boots, model, result.flags.noise, store);
+    var app: App = .init(gpa, term, journal, boots, model, options, store);
     defer app.deinit();
     try app.run();
 }
