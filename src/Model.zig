@@ -31,13 +31,43 @@ tail: usize,
 end: ending.Ending,
 /// Entries per category, after noise filtering.
 counts: std.EnumArray(Category, u32),
+/// How many earlier boots the groups' `new` flags were compared against. 0 when
+/// there are none or `Options.history` is 0: nothing is marked new then.
+compared: u32,
+/// Notable groups that are new.
+new_notable: u32,
 
-pub fn load(gpa: Allocator, journal: Journal, boots: []const Journal.Boot, index: usize, keep_noise: bool) !Model {
+pub const Options = struct {
+    /// Keep what `classify.isNoise` would hide.
+    keep_noise: bool = false,
+    /// A group is new if nothing like it was logged in this many earlier boots.
+    history: u32 = default_history,
+};
+
+pub const default_history = 5;
+
+pub fn load(gpa: Allocator, journal: Journal, boots: []const Journal.Boot, index: usize, options: Options) !Model {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
+    const keep_noise = options.keep_noise;
 
-    const entries = try journal.entries(a, &boots[index]);
+    // What the earlier boots complained about, as dedup keys.
+    var known: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer known.deinit(gpa);
+    const compared: u32 = @intCast(@min(index, options.history));
+    {
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        for (boots[index - compared .. index]) |*boot| {
+            for (try journal.entries(scratch.allocator(), boot, .classified)) |*e| {
+                if (classify.of(e) != .none) try known.put(gpa, dedup.key(e), {});
+            }
+            _ = scratch.reset(.retain_capacity);
+        }
+    }
+
+    const entries = try journal.entries(a, &boots[index], .all);
     const cats = try a.alloc(Category, entries.len);
     var counts: std.EnumArray(Category, u32) = .initFill(0);
     var notable: std.ArrayList(u32) = .empty;
@@ -56,6 +86,17 @@ pub fn load(gpa: Allocator, journal: Journal, boots: []const Journal.Boot, index
         while (tail > 0 and entries[tail - 1].usec >= cutoff) tail -= 1;
     }
 
+    const notable_groups = try dedup.group(a, entries, cats, notable.items);
+    const all_groups = try dedup.group(a, entries, cats, all.items);
+    var new_notable: u32 = 0;
+    if (compared > 0) {
+        for (notable_groups) |*g| {
+            g.new = !known.contains(g.key);
+            if (g.new) new_notable += 1;
+        }
+        for (all_groups) |*g| g.new = !known.contains(g.key);
+    }
+
     const last = boots.len - 1;
     return .{
         .arena = arena,
@@ -64,11 +105,13 @@ pub fn load(gpa: Allocator, journal: Journal, boots: []const Journal.Boot, index
         .next_first = if (index < last) boots[index + 1].first else null,
         .entries = entries,
         .cats = cats,
-        .notable = try dedup.group(a, entries, cats, notable.items),
-        .all = try dedup.group(a, entries, cats, all.items),
+        .notable = notable_groups,
+        .all = all_groups,
         .tail = tail,
         .end = ending.analyze(entries, index == last),
         .counts = counts,
+        .compared = compared,
+        .new_notable = new_notable,
     };
 }
 
