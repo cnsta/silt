@@ -11,6 +11,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addNixIncludePaths(b, c);
+    if (!haveSystemd(b)) {
+        // Instead of clang's "'systemd/sd-journal.h' not found".
+        const fail = b.addFail("libsystemd not found: build inside `nix develop path:.`, " ++
+            "or install libsystemd's development files and pkg-config");
+        c.step.dependOn(&fail.step);
+    }
 
     const exe = b.addExecutable(.{
         .name = "silt",
@@ -34,6 +40,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const tests = b.addTest(.{ .root_module = exe.root_module });
     test_step.dependOn(&b.addRunArtifact(tests).step);
+}
+
+fn haveSystemd(b: *std.Build) bool {
+    var code: u8 = undefined;
+    _ = b.runAllowFail(&.{ "pkg-config", "--exists", "libsystemd" }, &code, .ignore) catch return false;
+    return true;
 }
 
 fn addNixIncludePaths(b: *std.Build, tc: *std.Build.Step.TranslateC) void {
