@@ -6,6 +6,7 @@ const Allocator = mem.Allocator;
 
 const Entry = @import("Entry.zig");
 const catalog = @import("classify.zig").id;
+const classified_ids = @import("classify.zig").classified_ids;
 
 const Journal = @This();
 
@@ -78,10 +79,28 @@ fn seen(_: Journal, list: []const Boot, id: [32]u8) bool {
     return false;
 }
 
-/// Every entry of `boot`, oldest first, copied into `arena`.
-pub fn entries(self: Journal, arena: Allocator, boot: *const Boot) Error![]Entry {
-    try self.matchBoot(boot.id);
+pub const Scope = enum {
+    all,
+    /// Only what `classify.of` can give a category: warnings and worse, kernel
+    /// lines and the catalog ids it knows. A fraction of a boot.
+    classified,
+};
+
+/// The entries of `boot`, oldest first, copied into `arena`.
+pub fn entries(self: Journal, arena: Allocator, boot: *const Boot, scope: Scope) Error![]Entry {
     defer c.sd_journal_flush_matches(self.j);
+    try self.matchBoot(boot.id);
+    if (scope == .classified) {
+        // Same field: OR. Different fields: AND. So this is
+        // (boot AND prio 0..4) OR (boot AND kernel) OR (boot AND one of the ids).
+        inline for (.{ "0", "1", "2", "3", "4" }) |p| try self.match("PRIORITY=" ++ p);
+        if (c.sd_journal_add_disjunction(self.j) < 0) return error.JournalRead;
+        try self.matchBoot(boot.id);
+        try self.match("_TRANSPORT=kernel");
+        if (c.sd_journal_add_disjunction(self.j) < 0) return error.JournalRead;
+        try self.matchBoot(boot.id);
+        inline for (classified_ids) |id| try self.match("MESSAGE_ID=" ++ id);
+    }
     if (c.sd_journal_seek_head(self.j) < 0) return error.JournalRead;
 
     var list: std.ArrayList(Entry) = .empty;
@@ -116,6 +135,10 @@ fn matchBoot(self: Journal, id: [32]u8) Error!void {
     @memcpy(buf[0..prefix.len], prefix);
     @memcpy(buf[prefix.len..], &id);
     if (c.sd_journal_add_match(self.j, &buf, buf.len) < 0) return error.JournalRead;
+}
+
+fn match(self: Journal, comptime expr: []const u8) Error!void {
+    if (c.sd_journal_add_match(self.j, expr.ptr, expr.len) < 0) return error.JournalRead;
 }
 
 fn realtime(self: Journal) ?u64 {
