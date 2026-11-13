@@ -36,13 +36,29 @@ pub fn enter() !Term {
     try posix.tcsetattr(fd, .FLUSH, raw);
 
     const term: Term = .{ .fd = fd, .orig = orig };
-    term.write("\x1b[?1049h\x1b[?25l");
+    // Alternate screen, no cursor, no autowrap (a row that is too wide must not
+    // spill into the next one).
+    term.write("\x1b[?1049h\x1b[?25l\x1b[?7l");
     active = term;
+    for ([_]posix.SIG{ .TERM, .HUP, .QUIT }) |sig| {
+        posix.sigaction(sig, &.{
+            .handler = .{ .handler = onSignal },
+            .mask = posix.sigemptyset(),
+            .flags = posix.SA.RESETHAND,
+        }, null);
+    }
     return term;
 }
 
+/// Restores the terminal, then lets the signal kill us: RESETHAND put the
+/// default action back and the signal is delivered again once we return.
+fn onSignal(sig: posix.SIG) callconv(.c) void {
+    if (active) |t| t.leave();
+    _ = linux.kill(linux.getpid(), sig);
+}
+
 pub fn leave(self: Term) void {
-    self.write("\x1b[0m\x1b[?25h\x1b[?1049l");
+    self.write("\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l");
     posix.tcsetattr(self.fd, .FLUSH, self.orig) catch {};
     _ = linux.close(self.fd);
     active = null;
