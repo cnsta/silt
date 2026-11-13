@@ -44,6 +44,8 @@ pub const id = struct {
     pub const unit_failed = "d9b373ed55a64feb8242e02dbe79a49c";
     pub const job_failed = "be02cf6855d2428ba40df7e9d022f03d";
     pub const oomd_kill = "d989611b15e44c9dbf31e3c81256e4ed";
+    /// "A process of this unit has been killed by the OOM killer."
+    pub const unit_oom = "fe6faa94e7774663a0da52717891d8ef";
     pub const shutdown = "98268866d1d54a499c4e98921d93bc40";
     pub const job_done = "39f53479d3a045ac8e11786248231fbf";
     pub const journal_started = "f77379a8490b408bbe5f6940505a777b";
@@ -80,11 +82,13 @@ const hardware_trouble = [_][]const u8{
 
 const gpu_drivers = [_][]const u8{ "amdgpu", "[drm", "NVRM", "nouveau", "i915", "xe " };
 /// Not plain "fault": "(default)" contains it.
-const gpu_trouble = [_][]const u8{ "timeout", "timed out", "reset", "hang", "page fault", "GPU fault", "lockup", "recover", "failed", "*ERROR*" };
+const gpu_trouble = [_][]const u8{ "timeout", "timed out", "page fault", "GPU fault", "lockup", "recover", "failed", "*ERROR*" };
+/// Only at the start of a word: "changed" contains "hang", "preset" "reset".
+const gpu_trouble_words = [_][]const u8{ "reset", "hang" };
 
 pub fn of(e: *const Entry) Category {
     if (eqlAny(e.message_id, &.{ id.coredump, id.terminated_abnormally })) return .crash;
-    if (mem.eql(u8, e.message_id, id.oomd_kill)) return .oom;
+    if (eqlAny(e.message_id, &.{ id.oomd_kill, id.unit_oom })) return .oom;
     if (eqlAny(e.message_id, &.{ id.unit_failed, id.job_failed })) return .unit;
     if (e.kernel) {
         // Before kernel_trouble: user-space traps also say "general protection fault".
@@ -93,7 +97,8 @@ pub fn of(e: *const Entry) Category {
         if (containsAny(e.message, &kernel_trouble)) return .kernel;
         if (containsAny(e.message, &hardware_fatal)) return .hardware;
         if (e.priority <= 4 and containsAny(e.message, &hardware_trouble)) return .hardware;
-        if (containsAny(e.message, &gpu_drivers) and containsAny(e.message, &gpu_trouble)) return .gpu;
+        if (containsAny(e.message, &gpu_drivers) and
+            (containsAny(e.message, &gpu_trouble) or startsWordAny(e.message, &gpu_trouble_words))) return .gpu;
     }
     if (e.priority <= 3) return .err;
     if (e.priority == 4) return .warn;
@@ -136,6 +141,17 @@ fn containsAny(s: []const u8, needles: []const []const u8) bool {
     return false;
 }
 
+/// Whether one of `needles` occurs in `s` not preceded by a letter.
+fn startsWordAny(s: []const u8, needles: []const []const u8) bool {
+    for (needles) |n| {
+        var from: usize = 0;
+        while (mem.findPos(u8, s, from, n)) |i| : (from = i + 1) {
+            if (i == 0 or !std.ascii.isAlphabetic(s[i - 1])) return true;
+        }
+    }
+    return false;
+}
+
 test of {
     const t = std.testing;
     try t.expectEqual(.crash, of(&.{ .usec = 0, .message_id = id.coredump }));
@@ -146,6 +162,10 @@ test of {
     try t.expectEqual(.gpu, of(&.{ .usec = 0, .kernel = true, .message = "amdgpu 0000:03:00.0: amdgpu: ring gfx_0.0.0 timeout" }));
     try t.expectEqual(.none, of(&.{ .usec = 0, .kernel = true, .message = "amdgpu: SMU is initialized successfully!" }));
     try t.expectEqual(.none, of(&.{ .usec = 0, .kernel = true, .message = "amdgpu: TMZ feature disabled as experimental (default)" }));
+    try t.expectEqual(.gpu, of(&.{ .usec = 0, .kernel = true, .message = "amdgpu 0000:03:00.0: amdgpu: GPU reset begin!" }));
+    try t.expectEqual(.gpu, of(&.{ .usec = 0, .kernel = true, .message = "[drm] GPU hang detected" }));
+    try t.expectEqual(.none, of(&.{ .usec = 0, .kernel = true, .message = "[drm] link rate changed, preset 2" }));
+    try t.expectEqual(.oom, of(&.{ .usec = 0, .priority = 4, .message_id = id.unit_oom }));
     try t.expectEqual(.none, of(&.{ .usec = 0, .kernel = true, .message = "EDAC MC: Ver: 3.0.0" }));
     try t.expectEqual(.hardware, of(&.{ .usec = 0, .kernel = true, .priority = 3, .message = "mce: [Hardware Error]: CPU 0" }));
     // Only kernel lines count as kernel trouble.

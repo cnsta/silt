@@ -21,6 +21,7 @@ test {
     _ = @import("ending.zig");
     _ = @import("Model.zig");
     _ = @import("timefmt.zig");
+    _ = @import("ui.zig");
     _ = @import("tui/keys.zig");
     _ = @import("tui/App.zig");
 }
@@ -66,9 +67,15 @@ pub fn main(init: process.Init) !void {
         std.debug.print("{s}", .{usage});
         process.exit(1);
     };
+    var out_buf: [4096]u8 = undefined;
+    var out = Io.File.stdout().writerStreaming(io, &out_buf);
+    const w = &out.interface;
+    const tty = Io.File.stdout().isTty(io) catch false;
+
     if (result.flags.h) {
-        std.debug.print("{s}", .{usage});
-        process.exit(0);
+        w.writeAll(usage) catch {};
+        w.flush() catch {};
+        return;
     }
     if (result.args.len != 0) {
         log.err("unknown option '{s}'", .{result.args[0]});
@@ -90,14 +97,13 @@ pub fn main(init: process.Init) !void {
     const boots = try journal.boots(gpa);
     defer gpa.free(boots);
 
-    var out_buf: [4096]u8 = undefined;
-    var out = Io.File.stdout().writerStreaming(io, &out_buf);
-    const w = &out.interface;
-    const tty = Io.File.stdout().isTty(io) catch false;
+    if (boots.len == 0) {
+        log.err("the journal has no boots; reading the system journal needs the systemd-journal or wheel group", .{});
+        process.exit(1);
+    }
 
     if (result.flags.list) {
-        try listBoots(w, boots);
-        try w.flush();
+        listBoots(w, boots) catch |err| writeFailed(&out, err);
         return;
     }
 
@@ -110,8 +116,9 @@ pub fn main(init: process.Init) !void {
 
     if (result.flags.plain or !tty) {
         defer model.deinit();
-        try plain.write(w, &model, store, tty);
-        try w.flush();
+        // https://no-color.org
+        const no_color = if (init.environ_map.get("NO_COLOR")) |v| v.len > 0 else false;
+        plain.write(w, &model, store, tty and !no_color) catch |err| writeFailed(&out, err);
         return;
     }
 
@@ -126,7 +133,15 @@ pub fn main(init: process.Init) !void {
     try app.run();
 }
 
-fn listBoots(w: *Io.Writer, boots: []const Journal.Boot) !void {
+/// A closed pipe (`silt -plain | head`) is a normal way to end, not an error trace.
+fn writeFailed(out: *Io.File.Writer, err: Io.Writer.Error) noreturn {
+    const cause: anyerror = out.err orelse err;
+    if (cause == error.BrokenPipe) process.exit(0);
+    log.err("cannot write to stdout: {s}", .{@errorName(cause)});
+    process.exit(1);
+}
+
+fn listBoots(w: *Io.Writer, boots: []const Journal.Boot) Io.Writer.Error!void {
     for (boots, 0..) |boot, i| {
         const offset = @as(i64, @intCast(i)) - @as(i64, @intCast(boots.len - 1));
         var num: [16]u8 = undefined;
@@ -139,4 +154,5 @@ fn listBoots(w: *Io.Writer, boots: []const Journal.Boot) !void {
         try w.print("{s: <9}", .{span.buffered()});
         try w.writeAll(if (i == boots.len - 1) "running\n" else if (boot.clean) "clean\n" else "unclean\n");
     }
+    try w.flush();
 }
