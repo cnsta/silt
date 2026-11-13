@@ -10,7 +10,7 @@ const tail_lines = 40;
 
 pub fn write(w: *Writer, m: *const Model, store: pstore.Status, colored: bool) Writer.Error!void {
     var rows: ui.Rows = .{ .w = w, .width = std.math.maxInt(usize), .colored = colored };
-    try ui.summary(&rows, m, store);
+    try ui.summary(&rows, m, store, false);
 
     if (m.notable.len > 0) {
         try heading(&rows, "notable", m.notable.len);
@@ -29,6 +29,7 @@ pub fn write(w: *Writer, m: *const Model, store: pstore.Status, colored: bool) W
         for (m.entries[start..], m.cats[start..]) |*e, cat| try ui.entryRow((try rows.next()).?, e, cat);
     }
     try rows.close();
+    try w.flush();
 }
 
 fn heading(rows: *ui.Rows, name: []const u8, count: usize) Writer.Error!void {
