@@ -161,7 +161,10 @@ fn handleMain(self: *App, k: Key) !bool {
                 self.typing = false;
                 self.search.clearRetainingCapacity();
             },
-            .backspace => _ = self.search.pop(),
+            // A whole codepoint, not its last byte.
+            .backspace => while (self.search.pop()) |b| {
+                if (b & 0xc0 != 0x80) break;
+            },
             .ctrl_u => self.search.clearRetainingCapacity(),
             .char => |c| if (c >= 0x20) try self.search.append(self.gpa, c),
             else => {},
@@ -188,8 +191,11 @@ fn handleMain(self: *App, k: Key) !bool {
             'b' => self.openPicker(),
             'n' => {
                 self.keep_noise = !self.keep_noise;
-                self.reload(Model.bootIndex(self.boots.len, self.model.offset).?);
-                self.status = if (self.keep_noise) "noise shown" else "noise hidden";
+                if (self.reload(Model.bootIndex(self.boots.len, self.model.offset).?)) {
+                    self.status = if (self.keep_noise) "noise shown" else "noise hidden";
+                } else {
+                    self.keep_noise = !self.keep_noise;
+                }
             },
             else => {},
         },
@@ -266,7 +272,7 @@ fn handleBoots(self: *App, k: Key) !void {
         .end => self.picker.sel = n - 1,
         .enter => {
             self.mode = .main;
-            self.reload(n - 1 - self.picker.sel);
+            _ = self.reload(n - 1 - self.picker.sel);
         },
         else => {},
     }
@@ -303,15 +309,17 @@ fn openPicker(self: *App) void {
     self.mode = .boots;
 }
 
-fn reload(self: *App, index: usize) void {
+/// False if the boot couldn't be loaded: the old one stays and `status` says why.
+fn reload(self: *App, index: usize) bool {
     const m = Model.load(self.gpa, self.journal, self.boots, index, self.keep_noise) catch |err| {
         self.status = @errorName(err);
-        return;
+        return false;
     };
     self.model.deinit();
     self.model = m;
     self.cursors = .initFill(.{});
     self.refilter() catch {};
+    return true;
 }
 
 // Drawing.
@@ -375,7 +383,7 @@ fn drawMain(self: *App) !void {
     switch (self.view) {
         .summary => {
             var rows = self.screenRows(2, self.size.rows -| 1);
-            try ui.summary(&rows, &self.model, self.store);
+            try ui.summary(&rows, &self.model, self.store, true);
             while (try rows.next()) |_| {}
             try rows.close();
         },
@@ -464,12 +472,18 @@ fn contextRows(self: *const App) usize {
     return self.size.rows -| (chrome_rows + 4 + self.messageLines());
 }
 
+/// The detail view shows at most this much of a message.
+const max_message_lines = 8;
+
+fn messageWrap(self: *const App) ui.Wrap {
+    return .{ .rest = self.model.entries[self.detail.center].message, .cols = self.size.cols -| 4 };
+}
+
 fn messageLines(self: *const App) usize {
-    const width = self.size.cols -| 4;
-    if (width == 0) return 1;
-    const cols = std.unicode.utf8CountCodepoints(self.model.entries[self.detail.center].message) catch
-        self.model.entries[self.detail.center].message.len;
-    return std.math.clamp(std.math.divCeil(usize, cols, width) catch 1, 1, 8);
+    var wrap = self.messageWrap();
+    var n: usize = 0;
+    while (n < max_message_lines and wrap.next() != null) n += 1;
+    return @max(n, 1);
 }
 
 fn detailTop(self: *const App) usize {
@@ -483,16 +497,13 @@ fn drawDetail(self: *App) !void {
     var rows = self.screenRows(1, self.size.rows -| 1);
 
     // The full message, wrapped.
-    const width = self.size.cols -| 4;
-    var rest = e.message;
+    var wrap = self.messageWrap();
     for (0..self.messageLines()) |_| {
         const l = (try rows.next()) orelse return;
         try l.text("  ");
         try l.fg(color.priority(e.priority));
         try l.bold();
-        const cut = codepointPrefix(rest, width);
-        try l.text(rest[0..cut]);
-        rest = rest[cut..];
+        try l.text(wrap.next() orelse "");
     }
 
     var l = (try rows.next()) orelse return;
@@ -621,21 +632,4 @@ fn drawFooter(self: *App) !void {
         }
     }
     try rows.close();
-}
-
-/// The longest prefix of `s` that is at most `cols` codepoints, cut on a codepoint boundary.
-fn codepointPrefix(s: []const u8, cols: usize) usize {
-    var i: usize = 0;
-    var n: usize = 0;
-    while (i < s.len and n < cols) : (n += 1) {
-        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-        i = @min(s.len, i + len);
-    }
-    return i;
-}
-
-test codepointPrefix {
-    try std.testing.expectEqual(3, codepointPrefix("abcdef", 3));
-    try std.testing.expectEqual(4, codepointPrefix("a×b", 3));
-    try std.testing.expectEqual(2, codepointPrefix("ab", 10));
 }
