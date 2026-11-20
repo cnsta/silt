@@ -55,8 +55,12 @@ pub fn key(e: *const Entry) u64 {
     var i: usize = 0;
     while (i < m.len) {
         if (!ascii.isHex(m[i])) {
-            h.update(m[i .. i + 1]);
-            i += 1;
+            // A whole run per update: streaming Wyhash hashes the same as
+            // byte by byte, at a fraction of the cost.
+            var j = i + 1;
+            while (j < m.len and !ascii.isHex(m[j])) j += 1;
+            h.update(m[i..j]);
+            i = j;
             continue;
         }
         var j = i;
@@ -77,6 +81,11 @@ test key {
     try std.testing.expectEqual(key(&a), key(&b));
     try std.testing.expect(key(&a) != key(&c));
     try std.testing.expect(key(&d) != key(&e));
+
+    // Batched runs hash like the byte-at-a-time stream they replace.
+    var h = std.hash.Wyhash.init(0);
+    for ("kernel\x00pid # at #x#") |ch| h.update(&.{ch});
+    try std.testing.expectEqual(h.final(), key(&a));
 }
 
 test Grouper {

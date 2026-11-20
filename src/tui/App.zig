@@ -3,6 +3,7 @@ const ascii = std.ascii;
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 
+const Cache = @import("../cache.zig");
 const Entry = @import("../Entry.zig");
 const Journal = @import("../Journal.zig");
 const Model = @import("../Model.zig");
@@ -40,6 +41,7 @@ const priority_names = [_][]const u8{ "emerg", "alert", "crit", "err", "warning"
 gpa: Allocator,
 term: Term,
 journal: Journal,
+cache: ?Cache,
 boots: []const Journal.Boot,
 model: Model,
 options: Model.Options,
@@ -66,11 +68,12 @@ picker: Cursor = .{},
 status: []const u8 = "",
 size: Term.Size = .{ .rows = 24, .cols = 80 },
 
-pub fn init(gpa: Allocator, term: Term, journal: Journal, boots: []const Journal.Boot, model: Model, options: Model.Options, store: pstore.Status) App {
+pub fn init(gpa: Allocator, term: Term, journal: Journal, cache: ?Cache, boots: []const Journal.Boot, model: Model, options: Model.Options, store: pstore.Status) App {
     return .{
         .gpa = gpa,
         .term = term,
         .journal = journal,
+        .cache = cache,
         .boots = boots,
         .model = model,
         .options = options,
@@ -384,7 +387,7 @@ fn openPicker(self: *App) void {
 
 /// False if the boot couldn't be loaded: the old one stays and `status` says why.
 fn reload(self: *App, index: usize) bool {
-    const m = Model.load(self.gpa, self.journal, self.boots, index, self.options) catch |err| {
+    const m = Model.load(self.gpa, self.journal, self.cache, self.boots, index, self.options) catch |err| {
         self.status = @errorName(err);
         return false;
     };

@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Entry = @import("Entry.zig");
+const Cache = @import("cache.zig");
 const Journal = @import("Journal.zig");
 const classify = @import("classify.zig");
 const dedup = @import("dedup.zig");
@@ -50,7 +51,8 @@ pub const Options = struct {
 
 pub const default_history = 5;
 
-pub fn load(gpa: Allocator, journal: Journal, boots: []const Journal.Boot, index: usize, options: Options) !Model {
+/// `cache` holds earlier boots' keys; null reads them from the journal every time.
+pub fn load(gpa: Allocator, journal: Journal, cache: ?Cache, boots: []const Journal.Boot, index: usize, options: Options) !Model {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -63,14 +65,22 @@ pub fn load(gpa: Allocator, journal: Journal, boots: []const Journal.Boot, index
     var known: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer known.deinit(gpa);
     const compared: u32 = @intCast(@min(index, options.history));
+    var keys: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
+    defer keys.deinit(gpa);
     for (boots[index - compared .. index]) |*boot| {
+        if (cache) |cc| if (try cc.load(gpa, boot, &known)) continue;
+        keys.clearRetainingCapacity();
         try journal.filter(boot.id, .classified);
         try journal.seek(.head);
         while (try journal.step(.next)) {
             _ = scratch.reset(.retain_capacity);
-            const e = try journal.entry(scratch.allocator()) orelse continue;
-            if (classify.of(&e) != .none) try known.put(gpa, dedup.key(&e), {});
+            const e = try journal.entry(scratch.allocator(), .without_cursor) orelse continue;
+            if (classify.of(&e) != .none) try keys.put(gpa, dedup.key(&e), {});
         }
+        // Earlier boots are finished, so this is final.
+        if (cache) |cc| cc.store(gpa, boot, keys.keys());
+        try known.ensureUnusedCapacity(gpa, @intCast(keys.count()));
+        for (keys.keys()) |k| known.putAssumeCapacity(k, {});
     }
 
     const boot = &boots[index];
@@ -83,7 +93,7 @@ pub fn load(gpa: Allocator, journal: Journal, boots: []const Journal.Boot, index
     try journal.seek(.tail);
     var cutoff: ?u64 = null;
     while (tail.items.len < tail_max and try journal.step(.previous)) {
-        const e = try journal.entry(tail_arena.allocator()) orelse continue;
+        const e = try journal.entry(tail_arena.allocator(), .with_cursor) orelse continue;
         cutoff = cutoff orelse e.usec -| tail_usec;
         if (e.usec < cutoff.?) break;
         try tail.append(tail_arena.allocator(), e);
@@ -92,7 +102,7 @@ pub fn load(gpa: Allocator, journal: Journal, boots: []const Journal.Boot, index
 
     // Before it only what can matter: everything classified, plus what the
     // ending is read from. The millions of routine lines a busy server logs
-    // are never visited. The detail view reads them around an entry on demand.
+    // are never visited; the detail view reads them around an entry on demand.
     var b: Builder = .{ .arena = a, .keep_noise = options.keep_noise };
     try journal.filter(boot.id, .viewed);
     // The last such entry before the tail, to stop at.
@@ -102,7 +112,7 @@ pub fn load(gpa: Allocator, journal: Journal, boots: []const Journal.Boot, index
         try journal.seek(.{ .cursor = start });
         while (try journal.step(.previous)) {
             if (journal.at(start)) continue;
-            stop = try journal.entry(a) orelse continue;
+            stop = try journal.entry(a, .with_cursor) orelse continue;
             break;
         }
     }
@@ -110,13 +120,14 @@ pub fn load(gpa: Allocator, journal: Journal, boots: []const Journal.Boot, index
         try journal.seek(.head);
         while (try journal.step(.next)) {
             _ = scratch.reset(.retain_capacity);
-            const e = try journal.entry(scratch.allocator()) orelse continue;
-            try b.add(&e, false);
+            const e = try journal.entry(scratch.allocator(), .without_cursor) orelse continue;
+            // Stored entries need their place for the detail view.
+            if (try b.add(&e, false)) |kept| kept.cursor = try journal.cursor(a);
             if (stop) |s| if (e.usec == s.usec and journal.at(s.cursor)) break;
         }
     }
     const tail_start: usize = b.entries.items.len;
-    for (tail.items) |*e| try b.add(e, true);
+    for (tail.items) |*e| _ = try b.add(e, true);
 
     var new_notable: u32 = 0;
     if (compared > 0) {
@@ -164,7 +175,8 @@ const Builder = struct {
     counts: std.EnumArray(Category, u32) = .initFill(0),
     ending: ending.Analyzer = .{},
 
-    fn add(b: *Builder, e: *const Entry, force: bool) Allocator.Error!void {
+    /// The stored copy, if `e` was kept.
+    fn add(b: *Builder, e: *const Entry, force: bool) Allocator.Error!?*Entry {
         const cat = categorize(e, b.keep_noise);
         b.counts.getPtr(cat).* += 1;
         b.ending.feed(e);
@@ -177,9 +189,10 @@ const Builder = struct {
             const new_notable = cat.notable() and try b.notable.add(b.arena, k, cat, index, e.usec);
             keep = keep or new_all or new_notable;
         }
-        if (!keep) return;
+        if (!keep) return null;
         try b.entries.append(b.arena, try e.dupe(b.arena));
         try b.cats.append(b.arena, cat);
+        return &b.entries.items[b.entries.items.len - 1];
     }
 };
 
@@ -188,15 +201,15 @@ test Builder {
     defer arena.deinit();
     var b: Builder = .{ .arena = arena.allocator(), .keep_noise = false };
     const flood: Entry = .{ .usec = 1, .priority = 3, .ident = "x", .message = "retry 1" };
-    try b.add(&flood, false);
+    _ = try b.add(&flood, false);
     for (2..1000) |i| {
         var e = flood;
         e.usec = i;
-        try b.add(&e, false);
+        try std.testing.expect(try b.add(&e, false) == null);
     }
-    try b.add(&.{ .usec = 1000, .ident = "x", .message = "routine" }, false);
-    try b.add(&.{ .usec = 1001, .priority = 3, .ident = "x", .message = "retry 1001" }, true);
-    try b.add(&.{ .usec = 1002, .message_id = classify.id.journal_stopped }, false);
+    _ = try b.add(&.{ .usec = 1000, .ident = "x", .message = "routine" }, false);
+    _ = try b.add(&.{ .usec = 1001, .priority = 3, .ident = "x", .message = "retry 1001" }, true);
+    _ = try b.add(&.{ .usec = 1002, .message_id = classify.id.journal_stopped }, false);
 
     // The flood is one stored entry, the routine line none; the forced one stays.
     try std.testing.expectEqual(2, b.entries.items.len);

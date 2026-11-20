@@ -143,26 +143,61 @@ pub fn step(self: Journal, dir: Direction) Error!bool {
     return rc > 0;
 }
 
-/// The current entry with its strings in `arena`, cursor included. Null for an
-/// entry without a timestamp.
-pub fn entry(self: Journal, arena: Allocator) Error!?Entry {
+/// The fields `entry` reads, in the order they're tried.
+const Wanted = enum {
+    PRIORITY,
+    _TRANSPORT,
+    SYSLOG_IDENTIFIER,
+    _COMM,
+    MESSAGE,
+    UNIT,
+    USER_UNIT,
+    _SYSTEMD_USER_UNIT,
+    _SYSTEMD_UNIT,
+    MESSAGE_ID,
+};
+
+pub const Cursor = enum { without_cursor, with_cursor };
+
+/// The current entry with its strings in `arena`. Null for an entry without a
+/// timestamp. A cursor costs an allocation, so only ask when it's kept.
+pub fn entry(self: Journal, arena: Allocator, want: Cursor) Error!?Entry {
     var e: Entry = .{ .usec = self.realtime() orelse return null };
-    e.priority = self.priority();
-    e.kernel = mem.eql(u8, self.field("_TRANSPORT") orelse "", "kernel");
-    e.ident = try self.dupeFirst(arena, &.{ "SYSLOG_IDENTIFIER", "_COMM" });
-    e.message = try self.dupeFirst(arena, &.{"MESSAGE"});
-    e.unit = try self.dupeFirst(arena, &.{"UNIT"});
-    if (e.unit.len == 0) {
-        e.unit = try self.dupeFirst(arena, &.{ "USER_UNIT", "_SYSTEMD_USER_UNIT" });
-        e.user_unit = e.unit.len != 0;
+    // One pass over the entry's fields: sd_journal_get_data scans (and
+    // decompresses) them from the start for every name.
+    var found: std.EnumArray(Wanted, ?[]const u8) = .initFill(null);
+    c.sd_journal_restart_data(self.j);
+    var data: ?*const anyopaque = null;
+    var len: usize = 0;
+    while (c.sd_journal_enumerate_available_data(self.j, &data, &len) > 0) {
+        const bytes = @as([*]const u8, @ptrCast(data orelse continue))[0..len];
+        const eq = mem.findScalar(u8, bytes, '=') orelse continue;
+        const name = std.meta.stringToEnum(Wanted, bytes[0..eq]) orelse continue;
+        // The first of a repeated field wins, as with get_data. Copy now: the
+        // next call may reuse the buffer.
+        if (found.get(name) == null) found.set(name, try arena.dupe(u8, bytes[eq + 1 ..]));
     }
-    if (e.unit.len == 0) e.unit = try self.dupeFirst(arena, &.{"_SYSTEMD_UNIT"});
-    e.message_id = try self.dupeFirst(arena, &.{"MESSAGE_ID"});
-    e.cursor = try self.cursor(arena);
+
+    if (found.get(.PRIORITY)) |p| {
+        if (p.len == 1 and p[0] >= '0' and p[0] <= '7') e.priority = @intCast(p[0] - '0');
+    }
+    e.kernel = mem.eql(u8, found.get(._TRANSPORT) orelse "", "kernel");
+    e.ident = found.get(.SYSLOG_IDENTIFIER) orelse found.get(._COMM) orelse "";
+    e.message = found.get(.MESSAGE) orelse "";
+    if (found.get(.UNIT)) |u| {
+        e.unit = u;
+    } else if (found.get(.USER_UNIT) orelse found.get(._SYSTEMD_USER_UNIT)) |u| {
+        e.unit = u;
+        e.user_unit = true;
+    } else {
+        e.unit = found.get(._SYSTEMD_UNIT) orelse "";
+    }
+    e.message_id = found.get(.MESSAGE_ID) orelse "";
+    if (want == .with_cursor) e.cursor = try self.cursor(arena);
     return e;
 }
 
-fn cursor(self: Journal, arena: Allocator) Error![:0]const u8 {
+pub fn cursor(self: Journal, arena: Allocator) Error![:0]const u8 {
     var raw: [*c]u8 = null;
     if (c.sd_journal_get_cursor(self.j, &raw) < 0) return error.JournalRead;
     defer c.free(raw);
@@ -190,12 +225,12 @@ pub fn around(self: Journal, arena: Allocator, boot: [32]u8, pos: Position, span
 
     try self.seek(pos);
     const anchor = while (try self.step(if (pos == .tail) .previous else .next)) {
-        if (try self.entry(arena)) |e| break e;
+        if (try self.entry(arena, .with_cursor)) |e| break e;
     } else return .{ .entries = &.{}, .focus = 0, .at_head = true, .at_tail = true };
 
     var after: std.ArrayList(Entry) = .empty;
     while (after.items.len < span and try self.step(.next)) {
-        if (try self.entry(arena)) |e| try after.append(arena, e);
+        if (try self.entry(arena, .with_cursor)) |e| try after.append(arena, e);
     }
     const at_tail = after.items.len < span;
 
@@ -204,7 +239,7 @@ pub fn around(self: Journal, arena: Allocator, boot: [32]u8, pos: Position, span
     var before: std.ArrayList(Entry) = .empty;
     while (before.items.len < span and try self.step(.previous)) {
         if (self.at(anchor.cursor)) continue;
-        if (try self.entry(arena)) |e| try before.append(arena, e);
+        if (try self.entry(arena, .with_cursor)) |e| try before.append(arena, e);
     }
     const at_head = before.items.len < span;
 
@@ -233,26 +268,12 @@ fn realtime(self: Journal) ?u64 {
     return usec;
 }
 
-fn priority(self: Journal) u3 {
-    const value = self.field("PRIORITY") orelse return 6;
-    if (value.len != 1 or value[0] < '0' or value[0] > '7') return 6;
-    return @intCast(value[0] - '0');
-}
-
 /// The value of `name` in the current entry. Valid until the next sd-journal call.
 fn field(self: Journal, comptime name: [:0]const u8) ?[]const u8 {
     var data: ?*const anyopaque = null;
     var len: usize = 0;
     if (c.sd_journal_get_data(self.j, name.ptr, &data, &len) < 0) return null;
     return fieldValue(data, len, name);
-}
-
-/// A copy of the first of `names` that the current entry has, else "".
-fn dupeFirst(self: Journal, arena: Allocator, comptime names: []const [:0]const u8) Error![]const u8 {
-    inline for (names) |name| {
-        if (self.field(name)) |value| return arena.dupe(u8, value);
-    }
-    return "";
 }
 
 /// sd-journal hands out "NAME=value", strip the name.

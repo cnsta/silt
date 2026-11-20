@@ -6,6 +6,7 @@ const log = std.log;
 const Io = std.Io;
 
 const flags = @import("flags.zig");
+const Cache = @import("cache.zig");
 const Journal = @import("Journal.zig");
 const Model = @import("Model.zig");
 const pstore = @import("pstore.zig");
@@ -15,6 +16,7 @@ const App = @import("tui/App.zig");
 const Term = @import("tui/Term.zig");
 
 test {
+    _ = @import("cache.zig");
     _ = @import("Journal.zig");
     _ = @import("classify.zig");
     _ = @import("dedup.zig");
@@ -43,6 +45,8 @@ const usage =
     \\              Mark an event as new (+) if nothing like it was logged in the
     \\              n boots before (default 5, 0 turns it off).
     \\  -new        With -plain, list only the new notable events.
+    \\  -no-cache   Don't read or write ~/.cache/silt (earlier boots' events,
+    \\              kept so a flood in one is read only once).
     \\
 ;
 
@@ -69,6 +73,7 @@ pub fn main(init: process.Init) !void {
         .{ .name = "noise", .kind = .boolean },
         .{ .name = "history", .kind = .arg },
         .{ .name = "new", .kind = .boolean },
+        .{ .name = "no-cache", .kind = .boolean },
     }).parse(args[1..]) catch {
         std.debug.print("{s}", .{usage});
         process.exit(1);
@@ -124,7 +129,10 @@ pub fn main(init: process.Init) !void {
         log.err("no boot {d} (the journal has {d})", .{ offset, boots.len });
         process.exit(1);
     };
-    var model = try Model.load(gpa, journal, boots, index, options);
+    const cache: ?Cache = if (@field(result.flags, "no-cache")) null else Cache.open(io, init.environ_map);
+    defer if (cache) |cc| cc.close();
+    if (cache) |cc| cc.prune(boots);
+    var model = try Model.load(gpa, journal, cache, boots, index, options);
     const store = pstore.check(io);
 
     if (result.flags.plain or !tty) {
@@ -144,7 +152,7 @@ pub fn main(init: process.Init) !void {
         process.exit(1);
     };
     defer term.leave();
-    var app: App = .init(gpa, term, journal, boots, model, options, store);
+    var app: App = .init(gpa, term, journal, cache, boots, model, options, store);
     defer app.deinit();
     try app.run();
 }

@@ -18,10 +18,10 @@ journal, says how that boot ended, and shows only what's worth reading.
 - **pstore**: panics that never reached the journal, if readable.
 
 ```
-silt              # the previous boot, in a TUI
-silt -b -3        # boot offsets are journalctl's
-silt -list        # every boot and whether it ended cleanly
-silt -plain       # text, for pipes and ssh (the default when stdout isn't a tty)
+silt            # the previous boot, in a TUI
+silt -b -3      # boot offsets are journalctl's
+silt -list      # every boot and whether it ended cleanly
+silt -plain     # text, for pipes and ssh (the default when stdout isn't a tty)
 silt -plain -new  # only what the boots before didn't have
 ```
 
@@ -34,7 +34,9 @@ Reading the system journal needs the `systemd-journal` or `wheel` group.
 Big journals stay fast: silt reads only the warnings, kernel lines and catalog
 events it classifies (through the journal's index) plus the last 60 s, keeps one
 copy of each repeated event with an exact count, and reads the lines around an
-entry only when you open it.
+entry only when you open it. What earlier boots logged (for the `+` marks) is
+kept in `$XDG_CACHE_HOME/silt` (`~/.cache/silt`, usually KBs per boot), so a
+flood in an old boot is read once, not on every start; `-no-cache` skips it.
 
 NixOS: add the flake as an input (`inputs.nixpkgs.follows = "nixpkgs"`; that
 nixpkgs needs `zig_0_17`), import `silt.nixosModules.default`, and set
