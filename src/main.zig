@@ -9,6 +9,7 @@ const flags = @import("flags.zig");
 const Cache = @import("cache.zig");
 const Journal = @import("Journal.zig");
 const Model = @import("Model.zig");
+const Progress = @import("Progress.zig");
 const pstore = @import("pstore.zig");
 const plain = @import("plain.zig");
 const timefmt = @import("timefmt.zig");
@@ -22,6 +23,7 @@ test {
     _ = @import("dedup.zig");
     _ = @import("ending.zig");
     _ = @import("Model.zig");
+    _ = @import("Progress.zig");
     _ = @import("timefmt.zig");
     _ = @import("ui.zig");
     _ = @import("tui/keys.zig");
@@ -132,7 +134,13 @@ pub fn main(init: process.Init) !void {
     const cache: ?Cache = if (@field(result.flags, "no-cache")) null else Cache.open(io, init.environ_map);
     defer if (cache) |cc| cc.close();
     if (cache) |cc| cc.prune(boots);
-    var model = try Model.load(gpa, journal, cache, boots, index, options);
+    // A big journal takes a while: say so on the terminal, never in a pipe.
+    var sink_ctx: u8 = 0;
+    var progress: Progress = .init(.{ .ctx = &sink_ctx, .show = showStderr });
+    const stderr_tty = Io.File.stderr().isTty(io) catch false;
+    const loaded = Model.load(gpa, journal, cache, if (stderr_tty) &progress else null, boots, index, options);
+    progress.finish();
+    var model = try loaded;
     const store = pstore.check(io);
 
     if (result.flags.plain or !tty) {
@@ -179,4 +187,10 @@ fn listBoots(w: *Io.Writer, boots: []const Journal.Boot) Io.Writer.Error!void {
         try w.writeAll(if (i == boots.len - 1) "running\n" else if (boot.clean) "clean\n" else "unclean\n");
     }
     try w.flush();
+}
+
+fn showStderr(_: *anyopaque, line: []const u8) void {
+    var buf: [256]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "\r\x1b[K{s}", .{line}) catch return;
+    _ = std.os.linux.write(2, s.ptr, s.len);
 }

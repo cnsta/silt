@@ -7,6 +7,7 @@ const Cache = @import("../cache.zig");
 const Entry = @import("../Entry.zig");
 const Journal = @import("../Journal.zig");
 const Model = @import("../Model.zig");
+const Progress = @import("../Progress.zig");
 const dedup = @import("../dedup.zig");
 const pstore = @import("../pstore.zig");
 const ui = @import("../ui.zig");
@@ -387,7 +388,9 @@ fn openPicker(self: *App) void {
 
 /// False if the boot couldn't be loaded: the old one stays and `status` says why.
 fn reload(self: *App, index: usize) bool {
-    const m = Model.load(self.gpa, self.journal, self.cache, self.boots, index, self.options) catch |err| {
+    var progress: Progress = .init(.{ .ctx = self, .show = showFooter });
+    defer progress.finish();
+    const m = Model.load(self.gpa, self.journal, self.cache, &progress, self.boots, index, self.options) catch |err| {
         self.status = @errorName(err);
         return false;
     };
@@ -397,6 +400,14 @@ fn reload(self: *App, index: usize) bool {
     if (m.compared == 0) self.only_new = false;
     self.refilter() catch {};
     return true;
+}
+
+/// The loading spinner, over the footer until the next frame.
+fn showFooter(ctx: *anyopaque, line: []const u8) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    var buf: [256]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "\x1b[{d};1H\x1b[0m\x1b[K {s}", .{ self.size.rows, line }) catch return;
+    self.term.write(s);
 }
 
 // Drawing.

@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const Entry = @import("Entry.zig");
 const Cache = @import("cache.zig");
 const Journal = @import("Journal.zig");
+const Progress = @import("Progress.zig");
 const classify = @import("classify.zig");
 const dedup = @import("dedup.zig");
 const ending = @import("ending.zig");
@@ -52,7 +53,14 @@ pub const Options = struct {
 pub const default_history = 5;
 
 /// `cache` holds earlier boots' keys; null reads them from the journal every time.
-pub fn load(gpa: Allocator, journal: Journal, cache: ?Cache, boots: []const Journal.Boot, index: usize, options: Options) !Model {
+/// `progress` is ticked per entry read.
+pub fn load(gpa: Allocator, journal: Journal, cache: ?Cache, progress: ?*Progress, boots: []const Journal.Boot, index: usize, options: Options) !Model {
+    const last = boots.len - 1;
+    const offsetOf = struct {
+        fn f(i: usize, n: usize) i64 {
+            return @as(i64, @intCast(i)) - @as(i64, @intCast(n - 1));
+        }
+    }.f;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -67,13 +75,15 @@ pub fn load(gpa: Allocator, journal: Journal, cache: ?Cache, boots: []const Jour
     const compared: u32 = @intCast(@min(index, options.history));
     var keys: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
     defer keys.deinit(gpa);
-    for (boots[index - compared .. index]) |*boot| {
+    for (boots[index - compared .. index], index - compared..) |*boot, bi| {
         if (cache) |cc| if (try cc.load(gpa, boot, &known)) continue;
         keys.clearRetainingCapacity();
+        if (progress) |p| p.phase("comparing with boot {d}{s}", .{ offsetOf(bi, boots.len), if (cache != null) " (cached after this)" else "" });
         try journal.filter(boot.id, .classified);
         try journal.seek(.head);
         while (try journal.step(.next)) {
             _ = scratch.reset(.retain_capacity);
+            if (progress) |p| p.tick();
             const e = try journal.entry(scratch.allocator(), .without_cursor) orelse continue;
             if (classify.of(&e) != .none) try keys.put(gpa, dedup.key(&e), {});
         }
@@ -89,10 +99,12 @@ pub fn load(gpa: Allocator, journal: Journal, cache: ?Cache, boots: []const Jour
     var tail_arena: std.heap.ArenaAllocator = .init(gpa);
     defer tail_arena.deinit();
     var tail: std.ArrayList(Entry) = .empty;
+    if (progress) |p| p.phase("reading boot {d}", .{offsetOf(index, boots.len)});
     try journal.filter(boot.id, .all);
     try journal.seek(.tail);
     var cutoff: ?u64 = null;
     while (tail.items.len < tail_max and try journal.step(.previous)) {
+        if (progress) |p| p.tick();
         const e = try journal.entry(tail_arena.allocator(), .with_cursor) orelse continue;
         cutoff = cutoff orelse e.usec -| tail_usec;
         if (e.usec < cutoff.?) break;
@@ -120,6 +132,7 @@ pub fn load(gpa: Allocator, journal: Journal, cache: ?Cache, boots: []const Jour
         try journal.seek(.head);
         while (try journal.step(.next)) {
             _ = scratch.reset(.retain_capacity);
+            if (progress) |p| p.tick();
             const e = try journal.entry(scratch.allocator(), .without_cursor) orelse continue;
             // Stored entries need their place for the detail view.
             if (try b.add(&e, false)) |kept| kept.cursor = try journal.cursor(a);
@@ -138,7 +151,6 @@ pub fn load(gpa: Allocator, journal: Journal, cache: ?Cache, boots: []const Jour
         for (b.all.groups.items) |*g| g.new = !known.contains(g.key);
     }
 
-    const last = boots.len - 1;
     return .{
         .arena = arena,
         .boot = boots[index],
