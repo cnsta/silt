@@ -18,10 +18,10 @@ journal, says how that boot ended, and shows only what's worth reading.
 - **pstore**: panics that never reached the journal, if readable.
 
 ```
-silt            # the previous boot, in a TUI
-silt -b -3      # boot offsets are journalctl's
-silt -list      # every boot and whether it ended cleanly
-silt -plain     # text, for pipes and ssh (the default when stdout isn't a tty)
+silt              # the previous boot, in a TUI
+silt -b -3        # boot offsets are journalctl's
+silt -list        # every boot and whether it ended cleanly
+silt -plain       # text, for pipes and ssh (the default when stdout isn't a tty)
 silt -plain -new  # only what the boots before didn't have
 ```
 
