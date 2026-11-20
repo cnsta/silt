@@ -6,8 +6,10 @@ const Entry = @import("Entry.zig");
 const Category = @import("classify.zig").Category;
 
 pub const Group = struct {
+    /// Index of the first occurrence, the only one kept.
     first: u32,
-    last: u32,
+    /// When the latest occurrence was logged.
+    last_usec: u64,
     count: u32,
     cat: Category,
     /// `key` of its entries.
@@ -16,27 +18,32 @@ pub const Group = struct {
     new: bool = false,
 };
 
-/// Groups indices (ascending) by identifier plus message with numbers masked,
-/// in order of first appearance.
-pub fn group(gpa: Allocator, entries: []const Entry, cats: []const Category, indices: []const u32) Allocator.Error![]Group {
-    var seen: std.AutoHashMapUnmanaged(u64, u32) = .empty;
-    defer seen.deinit(gpa);
-    var groups: std.ArrayList(Group) = .empty;
-    errdefer groups.deinit(gpa);
-    for (indices) |i| {
-        const k = key(&entries[i]);
-        const gop = try seen.getOrPut(gpa, k);
-        if (gop.found_existing) {
-            const g = &groups.items[gop.value_ptr.*];
-            g.last = i;
-            g.count += 1;
-        } else {
-            gop.value_ptr.* = @intCast(groups.items.len);
-            try groups.append(gpa, .{ .first = i, .last = i, .count = 1, .cat = cats[i], .key = k });
-        }
+/// Groups entries by `key`, in order of first appearance. Only the first
+/// occurrence needs storing: later ones just bump `count` and `last_usec`, so a
+/// flood costs one entry.
+pub const Grouper = struct {
+    seen: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    groups: std.ArrayList(Group) = .empty,
+
+    pub fn deinit(g: *Grouper, gpa: Allocator) void {
+        g.seen.deinit(gpa);
+        g.groups.deinit(gpa);
     }
-    return groups.toOwnedSlice(gpa);
-}
+
+    /// True if `k` starts a new group, whose first occurrence is `index`.
+    pub fn add(g: *Grouper, gpa: Allocator, k: u64, cat: Category, index: u32, usec: u64) Allocator.Error!bool {
+        const gop = try g.seen.getOrPut(gpa, k);
+        if (gop.found_existing) {
+            const group = &g.groups.items[gop.value_ptr.*];
+            group.last_usec = usec;
+            group.count += 1;
+            return false;
+        }
+        gop.value_ptr.* = @intCast(g.groups.items.len);
+        try g.groups.append(gpa, .{ .first = index, .last_usec = usec, .count = 1, .cat = cat, .key = k });
+        return true;
+    }
+};
 
 /// Runs of hex digits containing a decimal digit (pids, addresses, counters) hash
 /// as one placeholder, so "pid 12" and "pid 3456" match but "dead" stays a word.
@@ -72,17 +79,14 @@ test key {
     try std.testing.expect(key(&d) != key(&e));
 }
 
-test group {
+test Grouper {
     const gpa = std.testing.allocator;
-    const entries = [_]Entry{
-        .{ .usec = 0, .ident = "x", .message = "retry 1" },
-        .{ .usec = 1, .ident = "y", .message = "other" },
-        .{ .usec = 2, .ident = "x", .message = "retry 2" },
-    };
-    const cats = [_]Category{ .err, .warn, .err };
-    const groups = try group(gpa, &entries, &cats, &.{ 0, 1, 2 });
-    defer gpa.free(groups);
-    try std.testing.expectEqual(2, groups.len);
-    try std.testing.expectEqual(Group{ .first = 0, .last = 2, .count = 2, .cat = .err, .key = key(&entries[0]) }, groups[0]);
-    try std.testing.expectEqual(1, groups[1].first);
+    var g: Grouper = .{};
+    defer g.deinit(gpa);
+    try std.testing.expect(try g.add(gpa, 7, .err, 0, 10));
+    try std.testing.expect(try g.add(gpa, 8, .warn, 1, 11));
+    try std.testing.expect(!try g.add(gpa, 7, .err, 99, 12));
+    try std.testing.expectEqual(2, g.groups.items.len);
+    try std.testing.expectEqual(Group{ .first = 0, .last_usec = 12, .count = 2, .cat = .err, .key = 7 }, g.groups.items[0]);
+    try std.testing.expectEqual(1, g.groups.items[1].first);
 }

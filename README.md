@@ -14,7 +14,7 @@ journal, says how that boot ended, and shows only what's worth reading.
   the 5 boots before (`-history <n>`, 0 turns it off), so the errors every boot
   has don't bury the one that matters. `+` in the TUI or `-plain -new` lists
   only those.
-- **Last 60s**: everything logged right before the end.
+- **Last 60s**: everything logged right before the end (at most 10 000 lines).
 - **pstore**: panics that never reached the journal, if readable.
 
 ```
@@ -25,10 +25,16 @@ silt -plain       # text, for pipes and ssh (the default when stdout isn't a tty
 silt -plain -new  # only what the boots before didn't have
 ```
 
-Keys: `tab`/`1`–`4` views, `j`/`k` move, `enter` details with surrounding lines,
-`/` search, `+` new only, `b` pick a boot, `n` toggle noise, `q` quit.
+Keys: `tab`/`1`–`4` views, `j`/`k` move, `enter` details with surrounding lines
+(`g`/`G` jump to the boot's start/end), `/` search, `+` new only, `b` pick a
+boot, `n` toggle noise, `q` quit.
 
 Reading the system journal needs the `systemd-journal` or `wheel` group.
+
+Big journals stay fast: silt reads only the warnings, kernel lines and catalog
+events it classifies (through the journal's index) plus the last 60 s, keeps one
+copy of each repeated event with an exact count, and reads the lines around an
+entry only when you open it.
 
 NixOS: add the flake as an input (`inputs.nixpkgs.follows = "nixpkgs"`; that
 nixpkgs needs `zig_0_17`), import `silt.nixosModules.default`, and set

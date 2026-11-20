@@ -7,6 +7,7 @@ const Allocator = mem.Allocator;
 const Entry = @import("Entry.zig");
 const catalog = @import("classify.zig").id;
 const classified_ids = @import("classify.zig").classified_ids;
+const ending_ids = @import("ending.zig").ids;
 
 const Journal = @This();
 
@@ -51,15 +52,15 @@ pub fn boots(self: Journal, gpa: Allocator) Error![]Boot {
         const at_tail = c.sd_journal_seek_tail(self.j) >= 0 and c.sd_journal_previous(self.j) > 0;
         const last = if (at_tail) self.realtime() else null;
         const clean = at_tail and mem.eql(u8, self.field("MESSAGE_ID") orelse "", catalog.journal_stopped);
-        var cursor: [*c]u8 = null;
-        if (at_tail and c.sd_journal_get_cursor(self.j, &cursor) < 0) cursor = null;
-        defer c.free(cursor);
+        var raw: [*c]u8 = null;
+        if (at_tail and c.sd_journal_get_cursor(self.j, &raw) < 0) raw = null;
+        defer c.free(raw);
         c.sd_journal_flush_matches(self.j);
-        if (first == null or last == null or cursor == null) return error.JournalRead;
+        if (first == null or last == null or raw == null) return error.JournalRead;
         try list.append(gpa, .{ .id = id, .first = first.?, .last = last.?, .clean = clean });
 
         // The entry after this boot's last one, in journal order, starts the next boot.
-        if (c.sd_journal_seek_cursor(self.j, cursor) < 0 or c.sd_journal_next(self.j) <= 0) return error.JournalRead;
+        if (c.sd_journal_seek_cursor(self.j, raw) < 0 or c.sd_journal_next(self.j) <= 0) return error.JournalRead;
         id = while (c.sd_journal_next(self.j) > 0) {
             const next = self.bootId() orelse continue;
             if (!mem.eql(u8, &next, &id) and !self.seen(list.items, next)) break next;
@@ -82,51 +83,136 @@ fn seen(_: Journal, list: []const Boot, id: [32]u8) bool {
 pub const Scope = enum {
     all,
     /// Only what `classify.of` can give a category: warnings and worse, kernel
-    /// lines and the catalog ids it knows. A fraction of a boot.
+    /// lines and the catalog ids it knows. A fraction of a boot, and sd-journal
+    /// finds it through its field index without visiting the rest.
     classified,
+    /// `classified` plus the catalog ids `ending.Analyzer` reads.
+    viewed,
 };
 
-/// The entries of `boot`, oldest first, copied into `arena`.
-pub fn entries(self: Journal, arena: Allocator, boot: *const Boot, scope: Scope) Error![]Entry {
-    defer c.sd_journal_flush_matches(self.j);
-    try self.matchBoot(boot.id);
-    if (scope == .classified) {
-        // Same field: OR. Different fields: AND. So this is
-        // (boot AND prio 0..4) OR (boot AND kernel) OR (boot AND one of the ids).
-        inline for (.{ "0", "1", "2", "3", "4" }) |p| try self.match("PRIORITY=" ++ p);
-        if (c.sd_journal_add_disjunction(self.j) < 0) return error.JournalRead;
-        try self.matchBoot(boot.id);
-        try self.match("_TRANSPORT=kernel");
-        if (c.sd_journal_add_disjunction(self.j) < 0) return error.JournalRead;
-        try self.matchBoot(boot.id);
-        inline for (classified_ids) |id| try self.match("MESSAGE_ID=" ++ id);
+/// Limits reading to `boot` and `scope` until the next `filter` or `unfilter`.
+pub fn filter(self: Journal, boot: [32]u8, scope: Scope) Error!void {
+    self.unfilter();
+    try self.matchBoot(boot);
+    if (scope == .all) return;
+    // Same field: OR. Different fields: AND. So this is
+    // (boot AND prio 0..4) OR (boot AND kernel) OR (boot AND one of the ids).
+    inline for (.{ "0", "1", "2", "3", "4" }) |p| try self.match("PRIORITY=" ++ p);
+    if (c.sd_journal_add_disjunction(self.j) < 0) return error.JournalRead;
+    try self.matchBoot(boot);
+    try self.match("_TRANSPORT=kernel");
+    if (c.sd_journal_add_disjunction(self.j) < 0) return error.JournalRead;
+    try self.matchBoot(boot);
+    inline for (classified_ids) |id| try self.match("MESSAGE_ID=" ++ id);
+    if (scope == .viewed) {
+        inline for (ending_ids) |id| try self.match("MESSAGE_ID=" ++ id);
     }
-    if (c.sd_journal_seek_head(self.j) < 0) return error.JournalRead;
+}
 
-    var list: std.ArrayList(Entry) = .empty;
-    while (true) {
-        const rc = c.sd_journal_next(self.j);
-        if (rc < 0) return error.JournalRead;
-        if (rc == 0) break;
-        var unit = try self.dupeFirst(arena, &.{"UNIT"});
-        var user_unit = false;
-        if (unit.len == 0) {
-            unit = try self.dupeFirst(arena, &.{ "USER_UNIT", "_SYSTEMD_USER_UNIT" });
-            user_unit = unit.len != 0;
-        }
-        if (unit.len == 0) unit = try self.dupeFirst(arena, &.{"_SYSTEMD_UNIT"});
-        try list.append(arena, .{
-            .usec = self.realtime() orelse continue,
-            .priority = self.priority(),
-            .kernel = mem.eql(u8, self.field("_TRANSPORT") orelse "", "kernel"),
-            .ident = try self.dupeFirst(arena, &.{ "SYSLOG_IDENTIFIER", "_COMM" }),
-            .message = try self.dupeFirst(arena, &.{"MESSAGE"}),
-            .unit = unit,
-            .user_unit = user_unit,
-            .message_id = try self.dupeFirst(arena, &.{"MESSAGE_ID"}),
-        });
+pub fn unfilter(self: Journal) void {
+    c.sd_journal_flush_matches(self.j);
+}
+
+pub const Position = union(enum) {
+    head,
+    tail,
+    /// From `Entry.cursor`.
+    cursor: [:0]const u8,
+};
+
+/// After this, `step` lands on the first (`.next`) or last (`.previous`)
+/// matching entry. For a cursor that is the entry itself if it matches.
+pub fn seek(self: Journal, pos: Position) Error!void {
+    const rc = switch (pos) {
+        .head => c.sd_journal_seek_head(self.j),
+        .tail => c.sd_journal_seek_tail(self.j),
+        .cursor => |s| c.sd_journal_seek_cursor(self.j, s.ptr),
+    };
+    if (rc < 0) return error.JournalRead;
+}
+
+pub const Direction = enum { next, previous };
+
+/// False at the end.
+pub fn step(self: Journal, dir: Direction) Error!bool {
+    const rc = switch (dir) {
+        .next => c.sd_journal_next(self.j),
+        .previous => c.sd_journal_previous(self.j),
+    };
+    if (rc < 0) return error.JournalRead;
+    return rc > 0;
+}
+
+/// The current entry with its strings in `arena`, cursor included. Null for an
+/// entry without a timestamp.
+pub fn entry(self: Journal, arena: Allocator) Error!?Entry {
+    var e: Entry = .{ .usec = self.realtime() orelse return null };
+    e.priority = self.priority();
+    e.kernel = mem.eql(u8, self.field("_TRANSPORT") orelse "", "kernel");
+    e.ident = try self.dupeFirst(arena, &.{ "SYSLOG_IDENTIFIER", "_COMM" });
+    e.message = try self.dupeFirst(arena, &.{"MESSAGE"});
+    e.unit = try self.dupeFirst(arena, &.{"UNIT"});
+    if (e.unit.len == 0) {
+        e.unit = try self.dupeFirst(arena, &.{ "USER_UNIT", "_SYSTEMD_USER_UNIT" });
+        e.user_unit = e.unit.len != 0;
     }
-    return list.items;
+    if (e.unit.len == 0) e.unit = try self.dupeFirst(arena, &.{"_SYSTEMD_UNIT"});
+    e.message_id = try self.dupeFirst(arena, &.{"MESSAGE_ID"});
+    e.cursor = try self.cursor(arena);
+    return e;
+}
+
+fn cursor(self: Journal, arena: Allocator) Error![:0]const u8 {
+    var raw: [*c]u8 = null;
+    if (c.sd_journal_get_cursor(self.j, &raw) < 0) return error.JournalRead;
+    defer c.free(raw);
+    return arena.dupeSentinel(u8, mem.span(raw), 0);
+}
+
+/// The current entry is the one `cursor` names.
+pub fn at(self: Journal, cur: [:0]const u8) bool {
+    return c.sd_journal_test_cursor(self.j, cur.ptr) > 0;
+}
+
+pub const Window = struct {
+    entries: []Entry,
+    /// Index of the entry the window was opened at.
+    focus: usize,
+    /// Nothing before or after the window in this boot.
+    at_head: bool,
+    at_tail: bool,
+};
+
+/// Up to `span` entries of `boot` on each side of `pos`, oldest first.
+pub fn around(self: Journal, arena: Allocator, boot: [32]u8, pos: Position, span: usize) Error!Window {
+    try self.filter(boot, .all);
+    defer self.unfilter();
+
+    try self.seek(pos);
+    const anchor = while (try self.step(if (pos == .tail) .previous else .next)) {
+        if (try self.entry(arena)) |e| break e;
+    } else return .{ .entries = &.{}, .focus = 0, .at_head = true, .at_tail = true };
+
+    var after: std.ArrayList(Entry) = .empty;
+    while (after.items.len < span and try self.step(.next)) {
+        if (try self.entry(arena)) |e| try after.append(arena, e);
+    }
+    const at_tail = after.items.len < span;
+
+    // Back to the anchor. A cursor seek is inclusive, so skip the anchor itself.
+    try self.seek(.{ .cursor = anchor.cursor });
+    var before: std.ArrayList(Entry) = .empty;
+    while (before.items.len < span and try self.step(.previous)) {
+        if (self.at(anchor.cursor)) continue;
+        if (try self.entry(arena)) |e| try before.append(arena, e);
+    }
+    const at_head = before.items.len < span;
+
+    const all = try arena.alloc(Entry, before.items.len + 1 + after.items.len);
+    for (before.items, 0..) |e, i| all[before.items.len - 1 - i] = e;
+    all[before.items.len] = anchor;
+    @memcpy(all[before.items.len + 1 ..], after.items);
+    return .{ .entries = all, .focus = before.items.len, .at_head = at_head, .at_tail = at_tail };
 }
 
 fn matchBoot(self: Journal, id: [32]u8) Error!void {

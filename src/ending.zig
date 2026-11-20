@@ -47,44 +47,61 @@ pub const Ending = struct {
     slept_at: ?u64 = null,
 };
 
-pub fn analyze(entries: []const Entry, running: bool) Ending {
-    var result: Ending = .{ .kind = .abrupt, .last = if (entries.len > 0) entries[entries.len - 1].usec else 0 };
-    var target: ?Kind = null;
+/// The MESSAGE_IDs `Analyzer` reads besides kernel lines. Loading a boot
+/// matches on them, so an id read here must be listed.
+pub const ids = [_][]const u8{ id.journal_started, id.journal_stopped, id.job_done, id.shutdown };
+
+/// Fed a boot's entries in journal order. Only kernel lines and `ids` matter,
+/// so feeding just those gives the same verdict.
+pub const Analyzer = struct {
+    last: u64 = 0,
+    shutdown_at: ?u64 = null,
+    target: ?Kind = null,
     // journald also stops once in the initrd, so only a stop that isn't followed
     // by another start counts.
-    var stopped = false;
-    var asleep: ?u64 = null;
+    stopped: bool = false,
+    asleep: ?u64 = null,
 
-    for (entries) |*e| {
-        if (mem.eql(u8, e.message_id, id.journal_stopped)) stopped = true;
-        if (mem.eql(u8, e.message_id, id.journal_started)) stopped = false;
+    pub fn feed(a: *Analyzer, e: *const Entry) void {
+        a.last = e.usec;
+        if (mem.eql(u8, e.message_id, id.journal_stopped)) a.stopped = true;
+        if (mem.eql(u8, e.message_id, id.journal_started)) a.stopped = false;
 
         const job_done = mem.eql(u8, e.message_id, id.job_done) and !e.user_unit;
         const announced = mem.eql(u8, e.message_id, id.shutdown) or
             (job_done and mem.eql(u8, e.unit, "shutdown.target"));
-        if (announced and result.shutdown_at == null) result.shutdown_at = e.usec;
+        if (announced and a.shutdown_at == null) a.shutdown_at = e.usec;
 
         if (job_done) {
-            if (targetKind(e.unit)) |k| target = k;
+            if (targetKind(e.unit)) |k| a.target = k;
         }
 
         if (e.kernel) {
-            if (contains(e.message, "suspend entry") or contains(e.message, "hibernation entry")) asleep = e.usec;
-            if (contains(e.message, "suspend exit") or contains(e.message, "hibernation exit")) asleep = null;
+            if (contains(e.message, "suspend entry") or contains(e.message, "hibernation entry")) a.asleep = e.usec;
+            if (contains(e.message, "suspend exit") or contains(e.message, "hibernation exit")) a.asleep = null;
         }
     }
 
-    if (running) {
-        result.kind = .running;
-    } else if (stopped) {
-        result.kind = target orelse .shutdown;
-    } else if (asleep) |t| {
-        result.kind = .asleep;
-        result.slept_at = t;
-    } else if (result.shutdown_at != null) {
-        result.kind = .shutdown_hung;
+    pub fn finish(a: *const Analyzer, running: bool) Ending {
+        var result: Ending = .{ .kind = .abrupt, .last = a.last, .shutdown_at = a.shutdown_at };
+        if (running) {
+            result.kind = .running;
+        } else if (a.stopped) {
+            result.kind = a.target orelse .shutdown;
+        } else if (a.asleep) |t| {
+            result.kind = .asleep;
+            result.slept_at = t;
+        } else if (a.shutdown_at != null) {
+            result.kind = .shutdown_hung;
+        }
+        return result;
     }
-    return result;
+};
+
+pub fn analyze(entries: []const Entry, running: bool) Ending {
+    var a: Analyzer = .{};
+    for (entries) |*e| a.feed(e);
+    return a.finish(running);
 }
 
 fn targetKind(unit: []const u8) ?Kind {

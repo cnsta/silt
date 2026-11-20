@@ -3,6 +3,7 @@ const ascii = std.ascii;
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 
+const Entry = @import("../Entry.zig");
 const Journal = @import("../Journal.zig");
 const Model = @import("../Model.zig");
 const dedup = @import("../dedup.zig");
@@ -20,6 +21,16 @@ pub const View = enum { summary, notable, last, all };
 const Mode = enum { main, detail, boots };
 
 const Cursor = struct { sel: usize = 0, top: usize = 0 };
+
+const Context = struct {
+    entries: []const Entry = &.{},
+    cats: []const ui.Category = &.{},
+    at_head: bool = true,
+    at_tail: bool = true,
+};
+
+/// Entries read on each side of the one the context window is opened at.
+const context_span = 1000;
 
 /// Header, tab bar and footer.
 const chrome_rows = 3;
@@ -44,7 +55,12 @@ typing: bool = false,
 only_new: bool = false,
 /// Indices into the current view's items that match `search` and `only_new`.
 visible: std.ArrayList(u32) = .empty,
-detail: struct { center: usize = 0, top: ?usize = null, group: ?dedup.Group = null } = .{},
+/// `center` indexes the model's entries, `top` the context window.
+detail: struct { center: usize = 0, top: usize = 0, group: ?dedup.Group = null } = .{},
+/// The entries around the detail view's one, read from the journal on demand
+/// (the model holds only a fraction of the boot).
+context: Context = .{},
+context_arena: std.heap.ArenaAllocator,
 picker: Cursor = .{},
 /// One-shot footer message, e.g. a failed boot load.
 status: []const u8 = "",
@@ -60,6 +76,7 @@ pub fn init(gpa: Allocator, term: Term, journal: Journal, boots: []const Journal
         .options = options,
         .store = store,
         .frame = .init(gpa),
+        .context_arena = .init(gpa),
     };
 }
 
@@ -67,6 +84,7 @@ pub fn deinit(self: *App) void {
     self.search.deinit(self.gpa);
     self.visible.deinit(self.gpa);
     self.frame.deinit();
+    self.context_arena.deinit();
     self.model.deinit();
 }
 
@@ -247,8 +265,8 @@ fn handleDetail(self: *App, k: Key) void {
             },
             'j' => 1,
             'k' => -1,
-            'g' => std.math.minInt(i32),
-            'G' => std.math.maxInt(i32),
+            'g' => return self.jumpContext(.head),
+            'G' => return self.jumpContext(.tail),
             else => return,
         },
         .left => {
@@ -259,13 +277,52 @@ fn handleDetail(self: *App, k: Key) void {
         .up => -1,
         .page_down, .ctrl_d => page,
         .page_up, .ctrl_u => -page,
-        .home => std.math.minInt(i32),
-        .end => std.math.maxInt(i32),
+        .home => return self.jumpContext(.head),
+        .end => return self.jumpContext(.tail),
         else => return,
     };
-    const max: i64 = @intCast(self.model.entries.len -| self.contextRows());
-    const top: i64 = @intCast(self.detailTop());
-    self.detail.top = @intCast(std.math.clamp(top + delta, 0, max));
+    self.scrollContext(delta) catch |err| self.contextFailed(err);
+}
+
+/// Scrolls the context, reading further entries when it runs past the window.
+fn scrollContext(self: *App, delta: i64) !void {
+    const rows = self.contextRows();
+    var top: i64 = @as(i64, @intCast(self.detail.top)) + delta;
+    const past_head = top < 0 and !self.context.at_head;
+    const past_tail = top + @as(i64, @intCast(rows)) > @as(i64, @intCast(self.context.entries.len)) and !self.context.at_tail;
+    if ((past_head or past_tail) and self.context.entries.len > 0) {
+        // Reopen the window around the current top entry; `context_span`
+        // exceeds a page, so one reload covers the step.
+        const anchor = try self.gpa.dupeSentinel(u8, self.context.entries[self.detail.top].cursor, 0);
+        defer self.gpa.free(anchor);
+        const focus = try self.loadContext(.{ .cursor = anchor });
+        top = @as(i64, @intCast(focus)) + delta;
+    }
+    const max: i64 = @intCast(self.context.entries.len -| rows);
+    self.detail.top = @intCast(std.math.clamp(top, 0, max));
+}
+
+fn jumpContext(self: *App, pos: Journal.Position) void {
+    _ = self.loadContext(pos) catch |err| return self.contextFailed(err);
+    self.detail.top = if (pos == .tail) self.context.entries.len -| self.contextRows() else 0;
+}
+
+/// Replaces the context window with one around `pos`. Returns the index of
+/// `pos`'s entry in it.
+fn loadContext(self: *App, pos: Journal.Position) !usize {
+    _ = self.context_arena.reset(.retain_capacity);
+    self.context = .{};
+    const a = self.context_arena.allocator();
+    const w = try self.journal.around(a, self.model.boot.id, pos, context_span);
+    const cats = try a.alloc(ui.Category, w.entries.len);
+    for (w.entries, cats) |*e, *cat| cat.* = Model.categorize(e, self.options.keep_noise);
+    self.context = .{ .entries = w.entries, .cats = cats, .at_head = w.at_head, .at_tail = w.at_tail };
+    return w.focus;
+}
+
+fn contextFailed(self: *App, err: anyerror) void {
+    self.mode = .main;
+    self.status = @errorName(err);
 }
 
 fn handleBoots(self: *App, k: Key) !void {
@@ -314,6 +371,8 @@ fn openDetail(self: *App) void {
     if (self.view == .summary or self.visible.items.len == 0) return;
     const i = self.visible.items[self.cursors.get(self.view).sel];
     self.detail = .{ .center = self.itemEntry(self.view, i), .group = self.itemGroup(self.view, i) };
+    const focus = self.loadContext(.{ .cursor = self.model.entries[self.detail.center].cursor }) catch |err| return self.contextFailed(err);
+    self.detail.top = focus -| self.contextRows() / 3;
     self.mode = .detail;
 }
 
@@ -513,10 +572,6 @@ fn messageLines(self: *const App) usize {
     return @max(n, 1);
 }
 
-fn detailTop(self: *const App) usize {
-    return self.detail.top orelse self.detail.center -| self.contextRows() / 3;
-}
-
 fn drawDetail(self: *App) !void {
     const m = &self.model;
     const e = &m.entries[self.detail.center];
@@ -556,7 +611,7 @@ fn drawDetail(self: *App) !void {
     if (self.detail.group) |g| if (g.count > 1) {
         try l.fg(color.yellow);
         try l.print(" · ×{d}, last at ", .{g.count});
-        try l.clock(m.entries[g.last].usec);
+        try l.clock(g.last_usec);
     };
 
     _ = try rows.next();
@@ -565,14 +620,16 @@ fn drawDetail(self: *App) !void {
     try l.fg(color.base01);
     try l.text("context");
 
-    const top = @min(self.detailTop(), m.entries.len -| self.contextRows());
+    // The window's length is fixed between reads, the terminal's isn't.
+    const ctx = &self.context;
+    const top = @min(self.detail.top, ctx.entries.len -| self.contextRows());
     self.detail.top = top;
-    var i = top;
-    while (i < m.entries.len) : (i += 1) {
+    for (ctx.entries[top..], ctx.cats[top..]) |*ce, ce_cat| {
         l = (try rows.next()) orelse break;
-        if (i == self.detail.center) try l.bg(color.base02);
-        try ui.entryRow(l, &m.entries[i], m.cats[i]);
-        if (i == self.detail.center) try l.fill();
+        const here = std.mem.eql(u8, ce.cursor, e.cursor);
+        if (here) try l.bg(color.base02);
+        try ui.entryRow(l, ce, ce_cat);
+        if (here) try l.fill();
     }
     while (try rows.next()) |_| {}
     try rows.close();
