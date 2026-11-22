@@ -109,36 +109,43 @@ pub fn main(init: process.Init) !void {
 
     c.tzset();
 
+    var sink_ctx: u8 = 0;
+    var progress: Progress = .init(.{ .ctx = &sink_ctx, .show = showStderr });
+    const stderr_tty = Io.File.stderr().isTty(io) catch false;
+    const p: ?*Progress = if (stderr_tty) &progress else null;
+
     const journal = Journal.open() catch {
         log.err("cannot open the journal", .{});
         process.exit(1);
     };
     defer journal.close();
-    const boots = try journal.boots(gpa);
+    const boots = journal.boots(gpa, p) catch |err| {
+        progress.finish();
+        return err;
+    };
     defer gpa.free(boots);
 
     if (boots.len == 0) {
+        progress.finish();
         log.err("the journal has no boots; reading the system journal needs the systemd-journal or wheel group", .{});
         process.exit(1);
     }
 
     if (result.flags.list) {
+        progress.finish();
         listBoots(w, boots) catch |err| writeFailed(&out, err);
         return;
     }
 
     const index = Model.bootIndex(boots.len, offset) orelse {
+        progress.finish();
         log.err("no boot {d} (the journal has {d})", .{ offset, boots.len });
         process.exit(1);
     };
     const cache: ?Cache = if (@field(result.flags, "no-cache")) null else Cache.open(io, init.environ_map);
     defer if (cache) |cc| cc.close();
     if (cache) |cc| cc.prune(boots);
-    // A big journal takes a while: say so on the terminal, never in a pipe.
-    var sink_ctx: u8 = 0;
-    var progress: Progress = .init(.{ .ctx = &sink_ctx, .show = showStderr });
-    const stderr_tty = Io.File.stderr().isTty(io) catch false;
-    const loaded = Model.load(gpa, journal, cache, if (stderr_tty) &progress else null, boots, index, options);
+    const loaded = Model.load(gpa, journal, cache, p, boots, index, options);
     progress.finish();
     var model = try loaded;
     const store = pstore.check(io);
