@@ -31,14 +31,20 @@ pub fn init(sink: Sink) Progress {
 pub fn phase(p: *Progress, comptime fmt: []const u8, args: anytype) void {
     p.label = std.fmt.bufPrint(&p.label_buf, fmt, args) catch p.label_buf[0..0];
     p.count = 0;
-    p.redraw();
+    p.redraw(.now);
 }
 
 /// One journal entry read.
 pub fn tick(p: *Progress) void {
     p.count += 1;
-    // The clock is cheap, but not per entry cheap.
-    if (p.count % 1024 == 0) p.redraw();
+    // The clock is cheap, but not per entry cheap. A cold page cache can make
+    // a thousand entries take most of a second, so not much rarer.
+    if (p.count % 64 == 0) p.redraw(.throttled);
+}
+
+/// Keeps the spinner turning in a loop that doesn't read lines.
+pub fn poll(p: *Progress) void {
+    p.redraw(.throttled);
 }
 
 /// Removes the line, if it was shown.
@@ -47,9 +53,12 @@ pub fn finish(p: *Progress) void {
     p.shown = false;
 }
 
-fn redraw(p: *Progress) void {
+/// `.now` skips the frame limit, so a new label isn't lost to it; nothing is
+/// shown before `delay_ms` either way.
+fn redraw(p: *Progress, when: enum { now, throttled }) void {
     const t = now();
-    if (t - p.start_ms < delay_ms or (p.shown and t - p.last_ms < frame_ms)) return;
+    if (t - p.start_ms < delay_ms) return;
+    if (when == .throttled and p.shown and t - p.last_ms < frame_ms) return;
     p.last_ms = t;
     p.frame = (p.frame + 1) % frames.len;
     var buf: [160]u8 = undefined;
