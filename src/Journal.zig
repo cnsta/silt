@@ -5,6 +5,7 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 const Entry = @import("Entry.zig");
+const Progress = @import("Progress.zig");
 const catalog = @import("classify.zig").id;
 const classified_ids = @import("classify.zig").classified_ids;
 const ending_ids = @import("ending.zig").ids;
@@ -37,10 +38,12 @@ pub fn close(self: Journal) void {
 /// Every boot in the journal, oldest first. Caller owns the slice.
 /// Walks boot to boot in journal order, as journalctl does, so the offsets match
 /// `journalctl -b`. Sorting by wall-clock start would reorder boots after an
-/// RTC jump.
-pub fn boots(self: Journal, gpa: Allocator) Error![]Boot {
+/// RTC jump. With a cold page cache this faults in every journal file, a second
+/// or more on a big journal, as with `journalctl --list-boots`.
+pub fn boots(self: Journal, gpa: Allocator, progress: ?*Progress) Error![]Boot {
     var list: std.ArrayList(Boot) = .empty;
     errdefer list.deinit(gpa);
+    if (progress) |p| p.phase("listing boots", .{});
 
     if (c.sd_journal_seek_head(self.j) < 0) return error.JournalRead;
     if (c.sd_journal_next(self.j) <= 0) return list.toOwnedSlice(gpa);
@@ -58,6 +61,7 @@ pub fn boots(self: Journal, gpa: Allocator) Error![]Boot {
         c.sd_journal_flush_matches(self.j);
         if (first == null or last == null or raw == null) return error.JournalRead;
         try list.append(gpa, .{ .id = id, .first = first.?, .last = last.?, .clean = clean });
+        if (progress) |p| p.poll();
 
         // The entry after this boot's last one, in journal order, starts the next boot.
         if (c.sd_journal_seek_cursor(self.j, raw) < 0 or c.sd_journal_next(self.j) <= 0) return error.JournalRead;
